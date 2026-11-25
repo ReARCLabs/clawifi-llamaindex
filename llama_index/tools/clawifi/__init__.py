@@ -1,3 +1,4 @@
+from llama_index.tools.clawifi._keyless import ClawifiKeylessError
 from llama_index.tools.clawifi.base import ClawifiToolSpec
 
-__all__ = ["ClawifiToolSpec"]
+__all__ = ["ClawifiKeylessError", "ClawifiToolSpec"]

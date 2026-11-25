@@ -17,7 +17,20 @@ pip install llama-index-tools-clawifi
 
 ## Credentials
 
-Pass `api_key=` or set `CLAWIFI_API_KEY`. Without a key, calls run as a keyless trial with lower limits (see [Rate limits](https://clawifi.dev/docs/rate-limits)).
+Pass `api_key=` or set `CLAWIFI_API_KEY`. Without a key the tools still work, through the keyless trial below.
+
+## Keyless trial
+
+The Clawifi REST API needs a key. Without one, the tools call the trial tools of Clawifi's hosted MCP server instead ([Remote MCP](https://clawifi.dev/docs/remote-mcp)): `search_free` and `fetch_url` at `https://api.clawifi.dev/mcp`. The trial's limits, from the Clawifi docs:
+
+- 12 calls a minute and 50 a day per address. On a shared host (serverless, CI) many apps can share one outbound address, so set `CLAWIFI_API_KEY` in production.
+- Search returns at most 3 results, and domain and time filters are not applied.
+- Fetched pages are cut at 20,000 characters; with `query`, up to 3 passages come back.
+- Usually the day's limit comes back as HTTP 401 ("keyless limit reached") and the minute's limit as HTTP 429 with `Retry-After`.
+
+A free account has 1,000 credits a month ([sign up](https://clawifi.dev/signup)). With a key, the tools use the REST API and your plan's limits.
+
+Without a key, every search `Document` also carries a `keyless_note` in its metadata that says which limits applied. Fetch results have the same fields with or without a key. Trial errors are raised as `ClawifiKeylessError` (with `status` and `retry_after`), a subclass of `clawifi.ClawifiError`.
 
 ## Usage
 
