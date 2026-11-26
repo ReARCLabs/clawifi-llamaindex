@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Any, List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, List, Optional
 
 from llama_index.core.schema import Document
 from llama_index.core.tools.tool_spec.base import BaseToolSpec
@@ -21,6 +22,7 @@ from llama_index.tools.clawifi._keyless import (
 )
 
 DEFAULT_MAX_CHARS = 20_000
+DEFAULT_MAX_RESULTS = 5
 
 
 class ClawifiToolSpec(BaseToolSpec):
@@ -39,7 +41,7 @@ class ClawifiToolSpec(BaseToolSpec):
         self,
         api_key: Optional[str] = None,
         *,
-        max_results: int = 5,
+        max_results: Optional[int] = None,
         max_chars: int = DEFAULT_MAX_CHARS,
         api_base: Optional[str] = None,
         client: Optional[Clawifi] = None,
@@ -49,7 +51,10 @@ class ClawifiToolSpec(BaseToolSpec):
     ) -> None:
         self._api_key = api_key
         self._api_base = api_base
-        self.max_results = max_results
+        # None means "not set by the user": the default of 5 is used, and a keyless
+        # note never claims the user asked for more than the trial's 3 results.
+        self._max_results_set = max_results is not None
+        self.max_results = max_results if max_results is not None else DEFAULT_MAX_RESULTS
         self.max_chars = max_chars
         self._client = client
         self._async_client = async_client
@@ -59,14 +64,33 @@ class ClawifiToolSpec(BaseToolSpec):
     @property
     def client(self) -> Clawifi:
         if self._client is None:
-            self._client = Clawifi(api_key=self._api_key, api_base=self._api_base)
+            if self._async_client is not None:
+                # Only an async client was given: reuse its key and base URL.
+                self._client = Clawifi(config=self._async_client.config)
+            else:
+                self._client = Clawifi(api_key=self._api_key, api_base=self._api_base)
         return self._client
 
-    @property
-    def async_client(self) -> AsyncClawifi:
-        if self._async_client is None:
-            self._async_client = AsyncClawifi(api_key=self._api_key, api_base=self._api_base)
-        return self._async_client
+    @asynccontextmanager
+    async def _async_rest(self) -> AsyncIterator[AsyncClawifi]:
+        """Yield an async REST client bound to the running event loop.
+
+        A client passed as ``async_client`` is used as is. Otherwise a new one is
+        opened for this call and closed after it, so nothing stays bound to an
+        event loop that ``asyncio.run`` has already closed.
+        """
+        if self._async_client is not None:
+            yield self._async_client
+            return
+        if self._client is not None:
+            # Only a sync client was given: reuse its key and base URL.
+            client = AsyncClawifi(config=self._client.config)
+        else:
+            client = AsyncClawifi(api_key=self._api_key, api_base=self._api_base)
+        try:
+            yield client
+        finally:
+            await client.aclose()
 
     @property
     def keyless_client(self) -> KeylessClient:
@@ -83,9 +107,15 @@ class ClawifiToolSpec(BaseToolSpec):
     def _has_key(self) -> bool:
         return bool(self._api_key or (os.getenv("CLAWIFI_API_KEY") or "").strip())
 
-    def _keyless(self, *, is_async: bool) -> bool:
-        prebuilt = self._async_client if is_async else self._client
-        return prebuilt is None and not self._has_key()
+    def _keyless(self) -> bool:
+        """Use the keyless trial only with no key and no pre-built REST client at all."""
+        return self._client is None and self._async_client is None and not self._has_key()
+
+    def _requested(self, max_results: Optional[int]) -> Optional[int]:
+        """The result count the user asked for: per call, or set on the spec; else None."""
+        if max_results is not None:
+            return max_results
+        return self.max_results if self._max_results_set else None
 
     # -- search -------------------------------------------------------------
 
@@ -115,12 +145,15 @@ class ClawifiToolSpec(BaseToolSpec):
             )
         return docs
 
-    def _keyless_docs(self, response: dict, body: dict) -> List[Document]:
-        requested = body.get("max_results")
+    def _keyless_docs(self, response: dict, body: dict, requested: Optional[int]) -> List[Document]:
         limit = min(requested or KEYLESS_MAX_RESULTS, KEYLESS_MAX_RESULTS)
         dropped = ["time_range"] if body.get("time_range") else []
         note = keyless_note(dropped, requested)
-        return self._search_docs(response, note)[:limit]
+        docs = self._search_docs(response, note)[:limit]
+        if not docs:
+            # Keep the note even when the trial search finds nothing.
+            return [Document(text=note, metadata={"keyless_note": note, "result_count": 0})]
+        return docs
 
     def search(
         self, query: str, max_results: Optional[int] = None, time_range: Optional[str] = None
@@ -135,9 +168,9 @@ class ClawifiToolSpec(BaseToolSpec):
 
         """
         body = self._search_body(max_results, time_range)
-        if self._keyless(is_async=False):
+        if self._keyless():
             response = self.keyless_client.call_tool(KEYLESS_SEARCH_TOOL, search_arguments(query))
-            return self._keyless_docs(response, body)
+            return self._keyless_docs(response, body, self._requested(max_results))
         return self._search_docs(self.client.search_free(query, **body))
 
     async def asearch(
@@ -153,12 +186,13 @@ class ClawifiToolSpec(BaseToolSpec):
 
         """
         body = self._search_body(max_results, time_range)
-        if self._keyless(is_async=True):
+        if self._keyless():
             response = await self.async_keyless_client.call_tool(
                 KEYLESS_SEARCH_TOOL, search_arguments(query)
             )
-            return self._keyless_docs(response, body)
-        return self._search_docs(await self.async_client.search_free(query, **body))
+            return self._keyless_docs(response, body, self._requested(max_results))
+        async with self._async_rest() as client:
+            return self._search_docs(await client.search_free(query, **body))
 
     # -- fetch --------------------------------------------------------------
 
@@ -189,7 +223,7 @@ class ClawifiToolSpec(BaseToolSpec):
             query: Optional question; when set, only the passages that answer it are returned.
 
         """
-        if self._keyless(is_async=False):
+        if self._keyless():
             response = self.keyless_client.call_tool(
                 KEYLESS_FETCH_TOOL, fetch_arguments(url, query)
             )
@@ -206,10 +240,11 @@ class ClawifiToolSpec(BaseToolSpec):
             query: Optional question; when set, only the passages that answer it are returned.
 
         """
-        if self._keyless(is_async=True):
+        if self._keyless():
             response = await self.async_keyless_client.call_tool(
                 KEYLESS_FETCH_TOOL, fetch_arguments(url, query)
             )
         else:
-            response = await self.async_client.fetch(url, **({"query": query} if query else {}))
+            async with self._async_rest() as client:
+                response = await client.fetch(url, **({"query": query} if query else {}))
         return self._fetch_doc(response)

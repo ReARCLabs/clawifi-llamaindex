@@ -7,21 +7,24 @@ at most 3 search results, no domain or time filters). This module speaks just
 enough MCP over streamable HTTP to call those two tools: ``initialize``, then
 ``notifications/initialized``, then ``tools/call``, carrying ``Mcp-Session-Id``
 and reading either a JSON or an SSE (``text/event-stream``) reply.
+
+Every failure, including a reply that cannot be decoded, is raised as
+:class:`ClawifiKeylessError`, a subclass of ``clawifi.ClawifiError``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 import json
 import os
 import threading
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
 
 from clawifi import ClawifiError
-from clawifi.errors import parse_retry_after
 
 DEFAULT_API_BASE = "https://api.clawifi.dev"
 PROTOCOL_VERSION = "2025-06-18"
@@ -32,7 +35,7 @@ CLIENT_INFO = {"name": "clawifi-python-integration", "version": "0.1.0"}
 
 
 class ClawifiKeylessError(ClawifiError):
-    """A keyless trial call failed: HTTP error, JSON-RPC error or tool error."""
+    """A keyless trial call failed: HTTP error, JSON-RPC error, tool error or bad reply."""
 
     def __init__(
         self,
@@ -53,7 +56,31 @@ def mcp_url(api_base: str | None = None) -> str:
     return f"{base}/mcp"
 
 
+def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
+    """Parse a ``Retry-After`` header: delay seconds or an HTTP date."""
+    if not value or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return max(float(text), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    return max((when - current).total_seconds(), 0.0)
+
+
 def keyless_note(dropped_filters: list[str], requested: int | None) -> str:
+    """The note added to keyless search results.
+
+    ``requested`` is the result count the user asked for, or ``None`` when they
+    did not ask for one; the cap is mentioned only when they asked for more.
+    """
     note = (
         "Keyless trial through Clawifi's hosted MCP server: at most "
         f"{KEYLESS_MAX_RESULTS} results, no domain or time filters, "
@@ -82,7 +109,7 @@ def _headers(session_id: str | None, protocol: str | None) -> dict[str, str]:
 
 
 def _http_error(response: httpx.Response) -> ClawifiKeylessError:
-    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+    retry_after = retry_after_seconds(response.headers.get("Retry-After"))
     message = ""
     code: Any = None
     try:
@@ -109,6 +136,20 @@ def _http_error(response: httpx.Response) -> ClawifiKeylessError:
     )
 
 
+def _bad_reply(response: httpx.Response, detail: str) -> ClawifiKeylessError:
+    return ClawifiKeylessError(
+        f"Clawifi MCP server sent a reply that could not be read: {detail}",
+        status=response.status_code,
+    )
+
+
+def _loads(text: str, response: httpx.Response) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise _bad_reply(response, f"invalid JSON ({exc})") from exc
+
+
 def _messages(response: httpx.Response) -> list[dict[str, Any]]:
     """Decode a JSON or SSE reply into JSON-RPC messages."""
     content_type = response.headers.get("content-type", "")
@@ -119,12 +160,12 @@ def _messages(response: httpx.Response) -> list[dict[str, Any]]:
             if line.startswith("data:"):
                 data.append(line[5:].lstrip(" "))
             elif line == "" and data:
-                messages.extend(_as_list(json.loads("\n".join(data))))
+                messages.extend(_as_list(_loads("\n".join(data), response)))
                 data = []
         return messages
     if not response.content:
         return []
-    return _as_list(response.json())
+    return _as_list(_loads(response.text, response))
 
 
 def _as_list(payload: Any) -> list[dict[str, Any]]:
@@ -132,25 +173,36 @@ def _as_list(payload: Any) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def _rpc_error(error: Any) -> ClawifiKeylessError:
+    if isinstance(error, dict):
+        return ClawifiKeylessError(
+            f"Clawifi keyless call failed: {error.get('message') or error}",
+            code=error.get("code"),
+        )
+    return ClawifiKeylessError(f"Clawifi keyless call failed: {error}")
+
+
 def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
     for message in _messages(response):
         if message.get("id") != request_id:
             continue
         if "error" in message:
-            error = message["error"] or {}
-            raise ClawifiKeylessError(
-                f"Clawifi keyless call failed: {error.get('message', error)}",
-                code=error.get("code"),
-            )
-        return message.get("result") or {}
+            raise _rpc_error(message["error"])
+        result = message.get("result")
+        if result is None:
+            return {}
+        if not isinstance(result, dict):
+            raise _bad_reply(response, "the JSON-RPC result is not an object")
+        return result
     raise ClawifiKeylessError("Clawifi MCP server sent no reply to the request.")
 
 
 def _tool_payload(result: dict[str, Any]) -> dict[str, Any]:
     """Turn a tools/call result into the tool's JSON object."""
+    content = result.get("content")
     texts = [
-        block.get("text", "")
-        for block in result.get("content") or []
+        str(block.get("text", ""))
+        for block in (content if isinstance(content, list) else [])
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     if result.get("isError"):
@@ -261,8 +313,58 @@ class KeylessClient:
             return _tool_payload(_result(response, request_id))
 
 
+class _AsyncSession:
+    """One MCP session on one ``httpx.AsyncClient``, used for a single tool call."""
+
+    def __init__(self, http: httpx.AsyncClient, url: str, ids: itertools.count) -> None:
+        self.http = http
+        self.url = url
+        self.ids = ids
+        self.session_id: str | None = None
+        self.protocol: str | None = None
+
+    async def post(self, body: dict[str, Any]) -> httpx.Response:
+        try:
+            return await self.http.post(
+                self.url, json=body, headers=_headers(self.session_id, self.protocol)
+            )
+        except httpx.HTTPError as exc:
+            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
+
+    async def initialize(self) -> None:
+        self.session_id = None
+        self.protocol = None
+        request_id = next(self.ids)
+        response = await self.post(_initialize_request(request_id))
+        if response.status_code >= 400:
+            raise _http_error(response)
+        result = _result(response, request_id)
+        self.session_id = response.headers.get("mcp-session-id")
+        self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
+        notified = await self.post(_INITIALIZED)
+        if notified.status_code >= 400:
+            raise _http_error(notified)
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        await self.initialize()
+        request_id = next(self.ids)
+        response = await self.post(_call_request(request_id, name, arguments))
+        if response.status_code == 404 and self.session_id:
+            await self.initialize()
+            request_id = next(self.ids)
+            response = await self.post(_call_request(request_id, name, arguments))
+        if response.status_code >= 400:
+            raise _http_error(response)
+        return _tool_payload(_result(response, request_id))
+
+
 class AsyncKeylessClient:
-    """Asynchronous keyless MCP client. One session, opened on the first call."""
+    """Asynchronous keyless MCP client.
+
+    Each call opens its own ``httpx.AsyncClient`` and MCP session inside the
+    running event loop, so the client can be reused across ``asyncio.run`` calls
+    (nothing stays bound to a loop that has closed).
+    """
 
     def __init__(
         self,
@@ -272,54 +374,21 @@ class AsyncKeylessClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.url = mcp_url(api_base)
-        self._http = httpx.AsyncClient(timeout=timeout, transport=transport)
+        self._timeout = timeout
+        self._transport = transport
         self._ids = itertools.count(1)
-        self._lock: asyncio.Lock | None = None
-        self.session_id: str | None = None
-        self.protocol: str | None = None
-        self._ready = False
 
     async def aclose(self) -> None:
-        await self._http.aclose()
-
-    async def _post(self, body: dict[str, Any]) -> httpx.Response:
-        try:
-            return await self._http.post(
-                self.url, json=body, headers=_headers(self.session_id, self.protocol)
-            )
-        except httpx.HTTPError as exc:
-            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
-
-    async def _initialize(self) -> None:
-        self.session_id = None
-        self.protocol = None
-        request_id = next(self._ids)
-        response = await self._post(_initialize_request(request_id))
-        if response.status_code >= 400:
-            raise _http_error(response)
-        result = _result(response, request_id)
-        self.session_id = response.headers.get("mcp-session-id")
-        self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
-        notified = await self._post(_INITIALIZED)
-        if notified.status_code >= 400:
-            raise _http_error(notified)
-        self._ready = True
+        """Kept for API symmetry; each call already closes its own HTTP client."""
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        async with self._lock:
-            if not self._ready:
-                await self._initialize()
-            request_id = next(self._ids)
-            response = await self._post(_call_request(request_id, name, arguments))
-            if response.status_code == 404 and self.session_id:
-                await self._initialize()
-                request_id = next(self._ids)
-                response = await self._post(_call_request(request_id, name, arguments))
-            if response.status_code >= 400:
-                raise _http_error(response)
-            return _tool_payload(_result(response, request_id))
+        http = httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
+        try:
+            return await _AsyncSession(http, self.url, self._ids).call(name, arguments)
+        finally:
+            # A transport passed in by the caller belongs to the caller: leave it open.
+            if self._transport is None:
+                await http.aclose()
 
 
 def search_arguments(query: str) -> dict[str, Any]:

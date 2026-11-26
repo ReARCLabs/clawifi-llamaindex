@@ -86,7 +86,7 @@ async def test_async_keyless_through_tool_list() -> None:
 
 
 def test_key_selects_rest_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert ClawifiToolSpec()._keyless(is_async=False) is True
-    assert ClawifiToolSpec(api_key="k")._keyless(is_async=False) is False
+    assert ClawifiToolSpec()._keyless() is True
+    assert ClawifiToolSpec(api_key="k")._keyless() is False
     monkeypatch.setenv("CLAWIFI_API_KEY", "env-key")
-    assert ClawifiToolSpec()._keyless(is_async=True) is False
+    assert ClawifiToolSpec()._keyless() is False

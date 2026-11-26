@@ -30,7 +30,7 @@ The Clawifi REST API needs a key. Without one, the tools call the trial tools of
 
 A free account has 1,000 credits a month ([sign up](https://clawifi.dev/signup)). With a key, the tools use the REST API and your plan's limits.
 
-Without a key, every search `Document` also carries a `keyless_note` in its metadata that says which limits applied. Fetch results have the same fields with or without a key. Trial errors are raised as `ClawifiKeylessError` (with `status` and `retry_after`), a subclass of `clawifi.ClawifiError`.
+Without a key, every search `Document` also carries a `keyless_note` in its metadata that says which limits applied. If the trial search finds nothing, the result is a single `Document` whose text is the note (`result_count: 0` in metadata), so the note is not lost. Fetch results have the same fields with or without a key. Trial errors are raised as `ClawifiKeylessError` (with `status` and `retry_after`), a subclass of `clawifi.ClawifiError`.
 
 ## Usage
 
@@ -55,7 +55,7 @@ page = spec.fetch(results[0].metadata["url"], query="who maintains it?")
 print(page[0].text)
 ```
 
-Options: `max_results` (default `5`), `max_chars` (default `20000`; longer pages are cut and marked `truncated` in metadata), `api_base`, and pre-built `client` / `async_client`.
+Options: `max_results` (default `5`; without a key the trial returns at most 3), `max_chars` (default `20000`; longer pages are cut and marked `truncated` in metadata), `api_base`, and pre-built `client` / `async_client`.
 
 Each call uses Clawifi credits; see [Pricing and credits](https://clawifi.dev/docs/pricing-and-credits). See `examples/clawifi_agent.py` for a runnable script.
 
