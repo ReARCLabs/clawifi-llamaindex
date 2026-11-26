@@ -6,9 +6,9 @@ import asyncio
 
 import httpx
 import pytest
-from clawifi import AsyncClawifi, Clawifi
+from clawifi import Clawifi
 
-from llama_index.tools.clawifi import ClawifiClientConfigError, ClawifiKeylessError, ClawifiToolSpec
+from llama_index.tools.clawifi import ClawifiKeylessError, ClawifiToolSpec
 from llama_index.tools.clawifi._keyless import (
     AsyncKeylessClient,
     KeylessClient,
@@ -71,31 +71,6 @@ def test_sync_spec_close_ends_session() -> None:
     spec.close()
     assert server.methods().count("initialize") == 1
     assert server.deleted_sessions == ["sess-1-1"]
-
-
-# Finding 3: custom HTTP settings are not dropped ----------------------------------
-
-
-def test_custom_sync_client_is_not_mirrored_to_async() -> None:
-    spec = ClawifiToolSpec(
-        client=Clawifi(api_key="k", transport=httpx.MockTransport(lambda r: httpx.Response(200)))
-    )
-    with pytest.raises(ClawifiClientConfigError, match="Pass async_client= as well"):
-        asyncio.run(spec.afetch("https://example.com"))
-
-
-def test_proxied_async_client_is_not_mirrored_to_sync() -> None:
-    async_client = AsyncClawifi(
-        api_key="k", transport=httpx.AsyncHTTPTransport(proxy="http://proxy.invalid:3128")
-    )
-    with pytest.raises(ClawifiClientConfigError, match="Pass client= as well"):
-        ClawifiToolSpec(async_client=async_client).search("mcp")
-
-
-def test_default_client_is_mirrored(router: Router) -> None:
-    docs = ClawifiToolSpec(async_client=AsyncClawifi(api_key="k")).fetch("https://example.com")
-    assert docs[0].text == "Body"
-    assert router.rest[0].headers["authorization"] == "Bearer k"
 
 
 # Finding 7: SSE pings are skipped ----------------------------------------------

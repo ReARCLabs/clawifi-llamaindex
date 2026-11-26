@@ -63,22 +63,6 @@ def test_unreadable_replies_raise_keyless_error(response: httpx.Response) -> Non
 # Finding 3 ----------------------------------------------------------------------
 
 
-def test_sync_client_only_then_async_call_uses_rest(router: Router) -> None:
-    spec = ClawifiToolSpec(client=Clawifi(api_key="sync-key"))
-    docs = asyncio.run(spec.asearch("mcp"))
-    assert router.mcp.requests == []
-    assert router.rest[0].headers["authorization"] == "Bearer sync-key"
-    assert "keyless_note" not in docs[0].metadata
-
-
-def test_async_client_only_then_sync_call_uses_rest(router: Router) -> None:
-    spec = ClawifiToolSpec(async_client=AsyncClawifi(api_key="async-key"))
-    docs = spec.fetch("https://example.com")
-    assert docs[0].text == "Body"
-    assert router.mcp.requests == []
-    assert router.rest[0].headers["authorization"] == "Bearer async-key"
-
-
 def test_keyless_only_without_key_and_without_clients() -> None:
     assert ClawifiToolSpec()._keyless() is True
     assert ClawifiToolSpec(client=Clawifi())._keyless() is False

@@ -14,7 +14,6 @@ Every failure, including a reply that cannot be decoded, is raised as
 
 from __future__ import annotations
 
-import asyncio
 import itertools
 import json
 import math
@@ -278,13 +277,16 @@ def _call_request(request_id: int, name: str, arguments: dict[str, Any]) -> dict
 
 # -- clients -------------------------------------------------------------------
 #
-# An MCP session is opened once and reused for later calls. close()/aclose()
-# end it with an HTTP DELETE, as the streamable HTTP transport specifies. If the
-# server drops a session (HTTP 404), a new one is opened and the call retried once.
+# The MCP session ID is a plain string, not tied to any connection or event loop.
+# Both clients keep it on the object and reuse it; if the server no longer knows
+# it (HTTP 404), they initialize once more and retry. A transport passed in by the
+# caller is never closed by these clients.
+
+_TRANSPORT_ERRORS = (httpx.HTTPError, RuntimeError)
 
 
 class _Session:
-    """MCP session state shared by the sync and async clients."""
+    """MCP session state: the session ID, the negotiated protocol and request IDs."""
 
     def __init__(self) -> None:
         self.ids = itertools.count(1)
@@ -298,6 +300,7 @@ class _Session:
     def opened(self, response: httpx.Response, result: dict[str, Any]) -> None:
         self.session_id = response.headers.get("mcp-session-id")
         self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
+        self.ready = True
 
     def reset(self) -> None:
         self.session_id = None
@@ -305,8 +308,17 @@ class _Session:
         self.ready = False
 
 
+def _unreachable(exc: BaseException) -> ClawifiKeylessError:
+    return ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}")
+
+
 class KeylessClient:
-    """Synchronous keyless MCP client. One session, opened on the first call."""
+    """Synchronous keyless MCP client.
+
+    The HTTP client is built on first use. ``close()`` ends the MCP session (HTTP
+    DELETE, errors ignored) and drops the HTTP client; the next call builds a new
+    one. A ``transport`` passed in belongs to the caller and is never closed.
+    """
 
     def __init__(
         self,
@@ -316,7 +328,9 @@ class KeylessClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.url = mcp_url(api_base)
-        self._http = httpx.Client(timeout=timeout, transport=transport)
+        self._timeout = timeout
+        self._transport = transport
+        self._http: httpx.Client | None = None
         self._lock = threading.Lock()
         self._session = _Session()
 
@@ -330,22 +344,29 @@ class KeylessClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    def _client(self) -> httpx.Client:
+        if self._http is None:
+            self._http = httpx.Client(timeout=self._timeout, transport=self._transport)
+        return self._http
+
     def close(self) -> None:
-        """End the MCP session (HTTP DELETE) and close the HTTP client."""
+        """End the MCP session (HTTP DELETE, errors ignored) and drop the HTTP client."""
         with self._lock:
-            if self._session.session_id and not self._http.is_closed:
+            if self._session.session_id:
                 try:
-                    self._http.delete(self.url, headers=self._session.headers())
-                except httpx.HTTPError:
+                    self._client().delete(self.url, headers=self._session.headers())
+                except _TRANSPORT_ERRORS:
                     pass  # best effort: the server expires idle sessions too
             self._session.reset()
-            self._http.close()
+            http, self._http = self._http, None
+            if http is not None and self._transport is None:  # the caller's transport stays open
+                http.close()
 
     def _post(self, body: dict[str, Any]) -> httpx.Response:
         try:
-            return self._http.post(self.url, json=body, headers=self._session.headers())
-        except httpx.HTTPError as exc:
-            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
+            return self._client().post(self.url, json=body, headers=self._session.headers())
+        except _TRANSPORT_ERRORS as exc:
+            raise _unreachable(exc) from exc
 
     def _initialize(self) -> None:
         self._session.reset()
@@ -356,8 +377,8 @@ class KeylessClient:
         self._session.opened(response, _result(response, request_id))
         notified = self._post(_INITIALIZED)
         if notified.status_code >= 400:
+            self._session.reset()
             raise _http_error(notified)
-        self._session.ready = True
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -366,7 +387,7 @@ class KeylessClient:
             request_id = next(self._session.ids)
             response = self._post(_call_request(request_id, name, arguments))
             if response.status_code == 404 and self._session.session_id:
-                # The server dropped the session: open a new one and retry once.
+                # The server no longer knows the session: initialize once more and retry.
                 self._initialize()
                 request_id = next(self._session.ids)
                 response = self._post(_call_request(request_id, name, arguments))
@@ -375,30 +396,16 @@ class KeylessClient:
             return _tool_payload(_result(response, request_id))
 
 
-class _LoopState:
-    """The HTTP client, lock and MCP session of one event loop."""
-
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        timeout: float,
-        transport: httpx.AsyncBaseTransport | None,
-    ) -> None:
-        self.loop = loop
-        self.http = httpx.AsyncClient(timeout=timeout, transport=transport)
-        self.lock = asyncio.Lock()
-        self.session = _Session()
-
-
 class AsyncKeylessClient:
     """Asynchronous keyless MCP client.
 
-    The HTTP client and MCP session belong to the event loop they were opened
-    in and are reused by later calls in that loop. When a call comes from a new
-    loop (a second ``asyncio.run``, say), a fresh HTTP client and session are
-    opened there, and the previous session is ended with a DELETE from the new
-    loop, so no session is left open on the server and nothing is used across
-    loops. ``aclose()`` ends the current session.
+    Every call opens a short-lived ``httpx.AsyncClient`` in the running event
+    loop, so nothing is ever used across loops (repeated ``asyncio.run`` works).
+    The MCP session ID is kept on the object and reused by later calls, whatever
+    loop they run in. Two concurrent first calls may each open a session; the
+    last one to finish is kept. ``aclose()`` ends the session with an HTTP DELETE
+    (errors ignored). A ``transport`` passed in belongs to the caller and is
+    never closed.
     """
 
     def __init__(
@@ -411,11 +418,11 @@ class AsyncKeylessClient:
         self.url = mcp_url(api_base)
         self._timeout = timeout
         self._transport = transport
-        self._state: _LoopState | None = None
+        self._session = _Session()
 
     @property
     def session_id(self) -> str | None:
-        return self._state.session.session_id if self._state else None
+        return self._session.session_id
 
     async def __aenter__(self) -> AsyncKeylessClient:
         return self
@@ -423,134 +430,79 @@ class AsyncKeylessClient:
     async def __aexit__(self, *args: object) -> None:
         await self.aclose()
 
-    async def _delete(self, http: httpx.AsyncClient, session: _Session) -> None:
-        if not session.session_id:
-            return
-        try:
-            await http.delete(self.url, headers=session.headers())
-        except httpx.HTTPError:
-            pass  # best effort: the server expires idle sessions too
-
-    async def _close_http(self, http: httpx.AsyncClient) -> None:
-        # A transport passed in by the caller belongs to the caller: leave it open.
-        if self._transport is None:
-            await http.aclose()
-
-    async def aclose(self) -> None:
-        """End the MCP session (HTTP DELETE) and close the HTTP client.
-
-        Call it from the event loop that made the calls.
-        """
-        state, self._state = self._state, None
-        if state is None:
-            return
-        if state.loop is asyncio.get_running_loop():
-            await self._delete(state.http, state.session)
-            await self._close_http(state.http)
-        elif state.session.session_id:
-            await self._end_orphan(state.session)
-
-    async def _end_orphan(self, session: _Session) -> None:
-        """End a session opened in a loop that is gone, from the current loop."""
+    async def _with_client(self, work: Any) -> Any:
         http = httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
         try:
-            await self._delete(http, session)
+            return await work(http)
         finally:
-            await self._close_http(http)
+            if self._transport is None:  # the caller's transport stays open
+                await http.aclose()
 
-    async def _current(self) -> _LoopState:
-        loop = asyncio.get_running_loop()
-        state = self._state
-        if state is not None and state.loop is loop:
-            return state
-        fresh = _LoopState(loop, self._timeout, self._transport)
-        self._state = fresh
-        if state is not None and state.session.session_id:
-            # The old loop's client cannot be used here; end its session from this loop.
-            await self._delete(fresh.http, state.session)
-        return fresh
+    async def aclose(self) -> None:
+        """End the MCP session with an HTTP DELETE (errors ignored)."""
+        session_id = self._session.session_id
+        headers = self._session.headers()
+        self._session.reset()
+        if not session_id:
+            return
 
-    async def _post(self, state: _LoopState, body: dict[str, Any]) -> httpx.Response:
+        async def delete(http: httpx.AsyncClient) -> None:
+            try:
+                await http.delete(self.url, headers=headers)
+            except _TRANSPORT_ERRORS:
+                pass  # best effort: the server expires idle sessions too
+
+        await self._with_client(delete)
+
+    async def _post(self, http: httpx.AsyncClient, body: dict[str, Any]) -> httpx.Response:
         try:
-            return await state.http.post(self.url, json=body, headers=state.session.headers())
-        except httpx.HTTPError as exc:
-            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
+            return await http.post(self.url, json=body, headers=self._session.headers())
+        except _TRANSPORT_ERRORS as exc:
+            raise _unreachable(exc) from exc
 
-    async def _initialize(self, state: _LoopState) -> None:
-        state.session.reset()
-        request_id = next(state.session.ids)
-        response = await self._post(state, _initialize_request(request_id))
+    async def _initialize(self, http: httpx.AsyncClient) -> None:
+        self._session.reset()
+        request_id = next(self._session.ids)
+        response = await self._post(http, _initialize_request(request_id))
         if response.status_code >= 400:
             raise _http_error(response)
-        state.session.opened(response, _result(response, request_id))
-        notified = await self._post(state, _INITIALIZED)
+        self._session.opened(response, _result(response, request_id))
+        notified = await self._post(http, _INITIALIZED)
         if notified.status_code >= 400:
+            self._session.reset()
             raise _http_error(notified)
-        state.session.ready = True
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        state = await self._current()
-        async with state.lock:
-            if not state.session.ready:
-                await self._initialize(state)
-            request_id = next(state.session.ids)
-            response = await self._post(state, _call_request(request_id, name, arguments))
-            if response.status_code == 404 and state.session.session_id:
-                await self._initialize(state)
-                request_id = next(state.session.ids)
-                response = await self._post(state, _call_request(request_id, name, arguments))
+        async def call(http: httpx.AsyncClient) -> dict[str, Any]:
+            if not self._session.ready:
+                await self._initialize(http)
+            request_id = next(self._session.ids)
+            response = await self._post(http, _call_request(request_id, name, arguments))
+            if response.status_code == 404 and self._session.session_id:
+                await self._initialize(http)
+                request_id = next(self._session.ids)
+                response = await self._post(http, _call_request(request_id, name, arguments))
             if response.status_code >= 400:
                 raise _http_error(response)
             return _tool_payload(_result(response, request_id))
 
+        return await self._with_client(call)
 
-# -- building the other mode's REST client ---------------------------------------
+
+# -- one given client, the other mode called -------------------------------------
 
 
 class ClawifiClientConfigError(ClawifiError):
-    """Only one of ``client`` / ``async_client`` was given and it cannot be mirrored."""
+    """Only one of ``client`` / ``async_client`` was given and the other mode was called."""
 
 
-_DEFAULT_POOLS = ("ConnectionPool", "AsyncConnectionPool")
-
-
-def _mount_signature(http: Any) -> list[tuple[str, str]]:
-    signature = []
-    for pattern, transport in (getattr(http, "_mounts", None) or {}).items():
-        pool = getattr(transport, "_pool", None)
-        proxy = getattr(pool, "_proxy_url", None)
-        signature.append((str(getattr(pattern, "pattern", pattern)), repr(proxy)))
-    return sorted(signature)
-
-
-def http_settings_copyable(sdk_client: Any) -> bool:
-    """True when the SDK client's HTTP layer is the default one (no custom transport or proxy).
-
-    Only then can the client for the other mode (sync/async) be rebuilt from
-    ``.config`` without losing anything. Environment proxies count as default,
-    since a new client picks them up too.
-    """
-    http = getattr(sdk_client, "_client", None)
-    transport = getattr(http, "_transport", None)
-    if http is None or transport is None or not hasattr(http, "_mounts"):
-        return False
-    if type(transport) not in (httpx.HTTPTransport, httpx.AsyncHTTPTransport):
-        return False
-    if type(getattr(transport, "_pool", None)).__name__ not in _DEFAULT_POOLS:
-        return False
-    reference = httpx.Client(trust_env=getattr(http, "trust_env", True))
-    try:
-        return _mount_signature(http) == _mount_signature(reference)
-    finally:
-        reference.close()
-
-
-def require_copyable(sdk_client: Any, given: str, missing: str) -> None:
-    if not http_settings_copyable(sdk_client):
-        raise ClawifiClientConfigError(
-            f"Only {given} was given, and its HTTP settings (a custom transport or proxy) "
-            f"cannot be copied to {missing}. Pass {missing}= as well."
-        )
+def missing_client_error(given: str, missing: str) -> ClawifiClientConfigError:
+    """The error for a call in the mode whose client was not given."""
+    mode = "async" if missing == "async_client" else "sync"
+    return ClawifiClientConfigError(
+        f"Only {given} was given, so there is no client for this {mode} call. "
+        f"Pass {missing} too, or pass api_key instead of clients."
+    )
 
 
 def search_arguments(query: str) -> dict[str, Any]:
