@@ -50,6 +50,8 @@ class FakeMcpServer:
         self.expire_session_once = False
         self.sessions_opened = 0
         self.deleted_sessions: list[str | None] = []
+        self.active: set[str] = set()  # sessions opened and not yet ended or expired
+        self.max_concurrent = 0
         self.sse_ping = False
 
     def methods(self) -> list[str]:
@@ -57,7 +59,7 @@ class FakeMcpServer:
 
     def open_sessions(self) -> int:
         """Sessions opened and not yet ended with DELETE."""
-        return self.sessions_opened - len(self.deleted_sessions)
+        return len(self.active)
 
     def calls(self) -> list[dict[str, Any]]:
         return [body["params"] for _, body in self.requests if body.get("method") == "tools/call"]
@@ -85,7 +87,9 @@ class FakeMcpServer:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         assert "authorization" not in request.headers
         if request.method == "DELETE":
-            self.deleted_sessions.append(request.headers.get("mcp-session-id"))
+            session = request.headers.get("mcp-session-id")
+            self.deleted_sessions.append(session)
+            self.active.discard(session or "")
             return httpx.Response(204)
         body = json.loads(request.content)
         self.requests.append((request, body))
@@ -96,11 +100,12 @@ class FakeMcpServer:
         method = body.get("method")
         if method == "initialize":
             self.sessions_opened += 1
-            headers = (
-                {"mcp-session-id": f"{self.session_id}-{self.sessions_opened}"}
-                if self.session_id
-                else {}
-            )
+            headers = {}
+            if self.session_id:
+                new_session = f"{self.session_id}-{self.sessions_opened}"
+                self.active.add(new_session)
+                self.max_concurrent = max(self.max_concurrent, len(self.active))
+                headers = {"mcp-session-id": new_session}
             result = {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
@@ -108,15 +113,14 @@ class FakeMcpServer:
             }
             return self._reply({"jsonrpc": "2.0", "id": body["id"], "result": result}, headers)
         if self.session_id:
-            assert (
-                request.headers.get("mcp-session-id") == f"{self.session_id}-{self.sessions_opened}"
-            )
+            assert request.headers.get("mcp-session-id") in self.active
         assert request.headers.get("mcp-protocol-version") == "2025-06-18"
         if method == "notifications/initialized":
             return httpx.Response(202)
         assert method == "tools/call"
         if self.expire_session_once:
             self.expire_session_once = False
+            self.active.discard(request.headers.get("mcp-session-id") or "")
             return httpx.Response(
                 404, json={"error": {"code": -32001, "message": "Session not found"}}
             )

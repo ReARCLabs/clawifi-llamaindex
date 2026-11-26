@@ -18,7 +18,6 @@ import itertools
 import json
 import math
 import os
-import threading
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -277,22 +276,54 @@ def _call_request(request_id: int, name: str, arguments: dict[str, Any]) -> dict
 
 # -- clients -------------------------------------------------------------------
 #
-# The MCP session ID is a plain string, not tied to any connection or event loop.
-# Both clients keep it on the object and reuse it; if the server no longer knows
-# it (HTTP 404), they initialize once more and retry. A transport passed in by the
-# caller is never closed by these clients.
+# Every keyless call opens its own short MCP session: initialize, then
+# notifications/initialized, then tools/call, and finally an HTTP DELETE to end
+# the session (a failed DELETE is ignored). Nothing about a session is shared
+# between calls, so concurrent calls cannot interfere. The live server keeps no
+# session state anyway; a session ID it sends back is used only within the call.
+# Opening a session per call costs a few extra requests; that is accepted for
+# the trial, and production use should set CLAWIFI_API_KEY.
+#
+# Every failure is raised as ClawifiKeylessError: HTTP status errors, bad
+# replies, and any httpx.HTTPError, httpx.InvalidURL, httpx.StreamError or
+# RuntimeError (such as a closed client) raised while sending a request.
 
-_TRANSPORT_ERRORS = (httpx.HTTPError, RuntimeError)
+_TRANSPORT_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, RuntimeError)
+
+
+class _BorrowedTransport(httpx.BaseTransport):
+    """Wraps a caller's transport so closing our client never closes theirs."""
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        pass  # the caller owns the transport
+
+
+class _BorrowedAsyncTransport(httpx.AsyncBaseTransport):
+    """Wraps a caller's async transport so closing our client never closes theirs."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        pass  # the caller owns the transport
 
 
 class _Session:
-    """MCP session state: the session ID, the negotiated protocol and request IDs."""
+    """One call's MCP session: request IDs, session ID and negotiated protocol."""
 
     def __init__(self) -> None:
         self.ids = itertools.count(1)
         self.session_id: str | None = None
         self.protocol: str | None = None
-        self.ready = False
 
     def headers(self) -> dict[str, str]:
         return _headers(self.session_id, self.protocol)
@@ -300,12 +331,6 @@ class _Session:
     def opened(self, response: httpx.Response, result: dict[str, Any]) -> None:
         self.session_id = response.headers.get("mcp-session-id")
         self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
-        self.ready = True
-
-    def reset(self) -> None:
-        self.session_id = None
-        self.protocol = None
-        self.ready = False
 
 
 def _unreachable(exc: BaseException) -> ClawifiKeylessError:
@@ -315,8 +340,8 @@ def _unreachable(exc: BaseException) -> ClawifiKeylessError:
 class KeylessClient:
     """Synchronous keyless MCP client.
 
-    The HTTP client is built on first use. ``close()`` ends the MCP session (HTTP
-    DELETE, errors ignored) and drops the HTTP client; the next call builds a new
+    Each ``call_tool`` opens and ends its own MCP session. One ``httpx.Client``
+    is reused across calls; ``close()`` closes it, and the next call builds a new
     one. A ``transport`` passed in belongs to the caller and is never closed.
     """
 
@@ -329,14 +354,8 @@ class KeylessClient:
     ) -> None:
         self.url = mcp_url(api_base)
         self._timeout = timeout
-        self._transport = transport
+        self._transport = _BorrowedTransport(transport) if transport is not None else None
         self._http: httpx.Client | None = None
-        self._lock = threading.Lock()
-        self._session = _Session()
-
-    @property
-    def session_id(self) -> str | None:
-        return self._session.session_id
 
     def __enter__(self) -> KeylessClient:
         return self
@@ -344,68 +363,73 @@ class KeylessClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def _client(self) -> httpx.Client:
-        if self._http is None:
-            self._http = httpx.Client(timeout=self._timeout, transport=self._transport)
-        return self._http
-
     def close(self) -> None:
-        """End the MCP session (HTTP DELETE, errors ignored) and drop the HTTP client."""
-        with self._lock:
-            if self._session.session_id:
-                try:
-                    self._client().delete(self.url, headers=self._session.headers())
-                except _TRANSPORT_ERRORS:
-                    pass  # best effort: the server expires idle sessions too
-            self._session.reset()
-            http, self._http = self._http, None
-            if http is not None and self._transport is None:  # the caller's transport stays open
-                http.close()
+        """Close the HTTP client; the next call builds a new one."""
+        http, self._http = self._http, None
+        if http is not None:
+            http.close()
 
-    def _post(self, body: dict[str, Any]) -> httpx.Response:
+    def _client(self) -> httpx.Client:
+        http = self._http
+        if http is None or http.is_closed:
+            http = httpx.Client(timeout=self._timeout, transport=self._transport)
+            self._http = http
+        return http
+
+    def _post(self, http: httpx.Client, session: _Session, body: dict[str, Any]) -> httpx.Response:
         try:
-            return self._client().post(self.url, json=body, headers=self._session.headers())
+            return http.post(self.url, json=body, headers=session.headers())
         except _TRANSPORT_ERRORS as exc:
             raise _unreachable(exc) from exc
 
-    def _initialize(self) -> None:
-        self._session.reset()
-        request_id = next(self._session.ids)
-        response = self._post(_initialize_request(request_id))
+    def _initialize(self, http: httpx.Client, session: _Session) -> None:
+        request_id = next(session.ids)
+        response = self._post(http, session, _initialize_request(request_id))
         if response.status_code >= 400:
             raise _http_error(response)
-        self._session.opened(response, _result(response, request_id))
-        notified = self._post(_INITIALIZED)
+        session.opened(response, _result(response, request_id))
+        notified = self._post(http, session, _INITIALIZED)
         if notified.status_code >= 400:
-            self._session.reset()
             raise _http_error(notified)
 
+    def _end(self, http: httpx.Client, session: _Session) -> None:
+        if not session.session_id:
+            return
+        try:
+            http.delete(self.url, headers=session.headers())
+        except _TRANSPORT_ERRORS:
+            pass  # best effort: the server expires idle sessions too
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            if not self._session.ready:
-                self._initialize()
-            request_id = next(self._session.ids)
-            response = self._post(_call_request(request_id, name, arguments))
-            if response.status_code == 404 and self._session.session_id:
-                # The server no longer knows the session: initialize once more and retry.
-                self._initialize()
-                request_id = next(self._session.ids)
-                response = self._post(_call_request(request_id, name, arguments))
+        try:
+            http = self._client()
+        except _TRANSPORT_ERRORS as exc:
+            raise _unreachable(exc) from exc
+        session = _Session()
+        try:
+            self._initialize(http, session)
+            request_id = next(session.ids)
+            response = self._post(http, session, _call_request(request_id, name, arguments))
+            if response.status_code == 404 and session.session_id:
+                # The server lost the session: open a new one and retry once.
+                session = _Session()
+                self._initialize(http, session)
+                request_id = next(session.ids)
+                response = self._post(http, session, _call_request(request_id, name, arguments))
             if response.status_code >= 400:
                 raise _http_error(response)
             return _tool_payload(_result(response, request_id))
+        finally:
+            self._end(http, session)
 
 
 class AsyncKeylessClient:
     """Asynchronous keyless MCP client.
 
-    Every call opens a short-lived ``httpx.AsyncClient`` in the running event
-    loop, so nothing is ever used across loops (repeated ``asyncio.run`` works).
-    The MCP session ID is kept on the object and reused by later calls, whatever
-    loop they run in. Two concurrent first calls may each open a session; the
-    last one to finish is kept. ``aclose()`` ends the session with an HTTP DELETE
-    (errors ignored). A ``transport`` passed in belongs to the caller and is
-    never closed.
+    Each ``call_tool`` opens its own ``httpx.AsyncClient`` (``async with``) and
+    its own MCP session, and ends both before returning. Nothing is shared
+    between calls, so concurrent calls and repeated ``asyncio.run`` are safe. A
+    ``transport`` passed in belongs to the caller and is never closed.
     """
 
     def __init__(
@@ -417,12 +441,7 @@ class AsyncKeylessClient:
     ) -> None:
         self.url = mcp_url(api_base)
         self._timeout = timeout
-        self._transport = transport
-        self._session = _Session()
-
-    @property
-    def session_id(self) -> str | None:
-        return self._session.session_id
+        self._transport = _BorrowedAsyncTransport(transport) if transport is not None else None
 
     async def __aenter__(self) -> AsyncKeylessClient:
         return self
@@ -430,78 +449,79 @@ class AsyncKeylessClient:
     async def __aexit__(self, *args: object) -> None:
         await self.aclose()
 
-    async def _with_client(self, work: Any) -> Any:
-        http = httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
-        try:
-            return await work(http)
-        finally:
-            if self._transport is None:  # the caller's transport stays open
-                await http.aclose()
-
     async def aclose(self) -> None:
-        """End the MCP session with an HTTP DELETE (errors ignored)."""
-        session_id = self._session.session_id
-        headers = self._session.headers()
-        self._session.reset()
-        if not session_id:
-            return
+        """Nothing to close: every call already closed its own client and session."""
 
-        async def delete(http: httpx.AsyncClient) -> None:
-            try:
-                await http.delete(self.url, headers=headers)
-            except _TRANSPORT_ERRORS:
-                pass  # best effort: the server expires idle sessions too
-
-        await self._with_client(delete)
-
-    async def _post(self, http: httpx.AsyncClient, body: dict[str, Any]) -> httpx.Response:
+    async def _post(
+        self, http: httpx.AsyncClient, session: _Session, body: dict[str, Any]
+    ) -> httpx.Response:
         try:
-            return await http.post(self.url, json=body, headers=self._session.headers())
+            return await http.post(self.url, json=body, headers=session.headers())
         except _TRANSPORT_ERRORS as exc:
             raise _unreachable(exc) from exc
 
-    async def _initialize(self, http: httpx.AsyncClient) -> None:
-        self._session.reset()
-        request_id = next(self._session.ids)
-        response = await self._post(http, _initialize_request(request_id))
+    async def _initialize(self, http: httpx.AsyncClient, session: _Session) -> None:
+        request_id = next(session.ids)
+        response = await self._post(http, session, _initialize_request(request_id))
         if response.status_code >= 400:
             raise _http_error(response)
-        self._session.opened(response, _result(response, request_id))
-        notified = await self._post(http, _INITIALIZED)
+        session.opened(response, _result(response, request_id))
+        notified = await self._post(http, session, _INITIALIZED)
         if notified.status_code >= 400:
-            self._session.reset()
             raise _http_error(notified)
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        async def call(http: httpx.AsyncClient) -> dict[str, Any]:
-            if not self._session.ready:
-                await self._initialize(http)
-            request_id = next(self._session.ids)
-            response = await self._post(http, _call_request(request_id, name, arguments))
-            if response.status_code == 404 and self._session.session_id:
-                await self._initialize(http)
-                request_id = next(self._session.ids)
-                response = await self._post(http, _call_request(request_id, name, arguments))
+    async def _end(self, http: httpx.AsyncClient, session: _Session) -> None:
+        if not session.session_id:
+            return
+        try:
+            await http.delete(self.url, headers=session.headers())
+        except _TRANSPORT_ERRORS:
+            pass  # best effort: the server expires idle sessions too
+
+    async def _call(
+        self, http: httpx.AsyncClient, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = _Session()
+        try:
+            await self._initialize(http, session)
+            request_id = next(session.ids)
+            response = await self._post(http, session, _call_request(request_id, name, arguments))
+            if response.status_code == 404 and session.session_id:
+                # The server lost the session: open a new one and retry once.
+                session = _Session()
+                await self._initialize(http, session)
+                request_id = next(session.ids)
+                response = await self._post(
+                    http, session, _call_request(request_id, name, arguments)
+                )
             if response.status_code >= 400:
                 raise _http_error(response)
             return _tool_payload(_result(response, request_id))
+        finally:
+            await self._end(http, session)
 
-        return await self._with_client(call)
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as http:
+                return await self._call(http, name, arguments)
+        except _TRANSPORT_ERRORS as exc:
+            # e.g. a failure while closing the client; the call itself wraps its own errors
+            raise _unreachable(exc) from exc
 
 
 # -- one given client, the other mode called -------------------------------------
 
 
 class ClawifiClientConfigError(ClawifiError):
-    """Only one of ``client`` / ``async_client`` was given and the other mode was called."""
+    """No key, only one of ``client`` / ``async_client`` given, and the other mode called."""
 
 
 def missing_client_error(given: str, missing: str) -> ClawifiClientConfigError:
     """The error for a call in the mode whose client was not given."""
     mode = "async" if missing == "async_client" else "sync"
     return ClawifiClientConfigError(
-        f"Only {given} was given, so there is no client for this {mode} call. "
-        f"Pass {missing} too, or pass api_key instead of clients."
+        f"Only {given} was given and there is no API key, so there is no client for this "
+        f"{mode} call. Pass {missing} too, or set an API key."
     )
 
 

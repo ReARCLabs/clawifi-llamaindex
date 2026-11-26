@@ -60,8 +60,9 @@ Options: `max_results` (default `5`; without a key the trial returns at most 3; 
 ### Clients and sessions
 
 - **Path:** Any key, or any client you pass, selects the REST API. The keyless trial is used only when there is neither.
-- **Sync and async:** To make both sync and async calls, pass `api_key` (both clients are built from it) or pass both `client` and `async_client`. If you pass only one of them, calls in the other mode raise `ClawifiClientConfigError`.
-- **Trial session:** The keyless trial keeps one MCP session ID and reuses it across calls, including across `asyncio.run` calls. `close()` (sync) or `await aclose()` (async) ends the session on the server. A transport you pass in is never closed.
+- **Sync and async:** With a key (`api_key` or `CLAWIFI_API_KEY`), a mode whose client you did not pass is built with that key. Without a key, pass both `client` and `async_client` if you call both modes; if you pass only one, calls in the other mode raise `ClawifiClientConfigError`.
+- **Trial sessions:** The keyless trial opens a short MCP session for every call and ends it when the call returns, so concurrent calls never share state. That costs a few extra requests per call (and a fresh connection for each async call). Use `CLAWIFI_API_KEY` in production.
+- **Closing:** `close()` closes the sync HTTP client; the next call builds a new one. `aclose()` has nothing to close. A transport you pass in is never closed.
 
 ## Development
 

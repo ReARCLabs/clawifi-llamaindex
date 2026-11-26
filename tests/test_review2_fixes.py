@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import pytest
 from clawifi import Clawifi
@@ -42,35 +40,6 @@ def test_reading_client_keeps_keyless(router: Router) -> None:
 
 def test_user_client_still_selects_rest() -> None:
     assert ClawifiToolSpec(client=Clawifi())._keyless() is False
-
-
-# Finding 2: one MCP session per loop, ended with DELETE ---------------------------
-
-
-def test_async_spec_reuses_one_session_and_aclose_ends_it() -> None:
-    server = FakeMcpServer()
-    spec = keyless_spec(server)
-
-    async def run() -> None:
-        await spec.asearch("a")
-        await spec.afetch("https://example.com")
-        await spec.asearch("b")
-        await spec.aclose()
-
-    asyncio.run(run())
-    assert server.methods().count("initialize") == 1
-    assert server.methods().count("tools/call") == 3
-    assert server.open_sessions() == 0
-
-
-def test_sync_spec_close_ends_session() -> None:
-    server = FakeMcpServer()
-    spec = keyless_spec(server)
-    spec.search("a")
-    spec.fetch("https://example.com")
-    spec.close()
-    assert server.methods().count("initialize") == 1
-    assert server.deleted_sessions == ["sess-1-1"]
 
 
 # Finding 7: SSE pings are skipped ----------------------------------------------

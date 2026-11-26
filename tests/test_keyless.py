@@ -52,14 +52,15 @@ def test_fetch_keyless_sse_same_fields() -> None:
     }
 
 
-def test_session_header_and_reopen() -> None:
+def test_each_call_opens_and_ends_its_session_and_reopens_on_404() -> None:
     server = FakeMcpServer()
     server.expire_session_once = True
     spec = keyless_spec(server)
+    spec.fetch("https://example.com")  # 404 on the first session, retried once
     spec.fetch("https://example.com")
-    spec.fetch("https://example.com")
-    assert server.methods().count("initialize") == 2
-    assert server.requests[-1][0].headers["mcp-session-id"] == "sess-1-2"
+    assert server.methods().count("initialize") == 3
+    assert server.deleted_sessions == ["sess-1-2", "sess-1-3"]
+    assert server.open_sessions() == 0
 
 
 def test_rate_limit_and_tool_error() -> None:

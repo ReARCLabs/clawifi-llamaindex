@@ -43,20 +43,6 @@ def test_mirroring_helpers_are_gone() -> None:
     assert not hasattr(keyless_module, "require_copyable")
 
 
-# 2. The session ID is reused across asyncio.run calls ---------------------------
-
-
-def test_two_asyncio_runs_reuse_the_same_session_id(router: Router) -> None:
-    spec = ClawifiToolSpec()
-    asyncio.run(spec.asearch("a"))
-    asyncio.run(spec.asearch("b"))
-    assert router.mcp.methods().count("initialize") == 1
-    calls = [r for r, body in router.mcp.requests if body.get("method") == "tools/call"]
-    assert [r.headers["mcp-session-id"] for r in calls] == ["sess-1-1", "sess-1-1"]
-    asyncio.run(spec.aclose())
-    assert router.mcp.open_sessions() == 0
-
-
 # 3. close() then another sync call works ------------------------------------------
 
 
