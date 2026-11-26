@@ -201,10 +201,17 @@ def _rpc_error(error: Any) -> ClawifiKeylessError:
 
 
 def _find_message(response: httpx.Response, request_id: int) -> dict[str, Any]:
-    """The JSON-RPC message that answers ``request_id``."""
+    """The JSON-RPC message that answers ``request_id``.
+
+    A server that cannot tell which request failed answers with an error whose
+    ``id`` is null; when nothing matches ``request_id``, that error is the answer.
+    """
     messages, unreadable = _messages(response)
     for message in messages:
         if message.get("id") == request_id:
+            return message
+    for message in messages:
+        if "id" in message and message["id"] is None and "error" in message:
             return message
     if unreadable:
         raise _bad_reply(
@@ -229,9 +236,10 @@ def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
 
 
 # A stateless server answers tools/call directly. A stateful one refuses it until
-# the client initializes: with JSON-RPC error -32002, or a message about
-# initialization or a session, sometimes as HTTP 400.
-_INIT_HINTS = ("not initialized", "initializ", "session")
+# the client initializes: with JSON-RPC error -32002, or with a message that
+# says so explicitly ("not initialized", "missing session", "Mcp-Session-Id"),
+# sometimes as HTTP 400. Any other error goes to the caller as it is.
+_INIT_HINTS = ("not initialized", "missing session", "mcp-session-id")
 _NOT_INITIALIZED_CODE = -32002
 
 
@@ -329,6 +337,10 @@ def _call_request(request_id: int, name: str, arguments: dict[str, Any]) -> dict
 _HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError)
 DELETE_TIMEOUT = 2.0
 
+# One module-level lock guards the (rare) lazy creation of HTTP clients. Keeping
+# no lock on the instances keeps them copyable and picklable.
+CLIENT_LOCK = threading.Lock()
+
 
 def _is_transport_error(exc: BaseException) -> bool:
     if isinstance(exc, _HTTPX_ERRORS):
@@ -388,8 +400,9 @@ _STILL_NOT_INITIALIZED = "Clawifi MCP server still asks for initialization after
 class KeylessClient:
     """Synchronous keyless MCP client: one ``tools/call`` POST per call.
 
-    One ``httpx.Client`` is built lazily (under a lock) and reused; ``close()``
-    closes it and the next call builds a new one. A ``transport`` passed in
+    One ``httpx.Client`` is built lazily (under a module-level lock) and reused;
+    ``close()`` closes it and the next call builds a new one. Copies and pickles
+    of the client leave the HTTP client out and build their own. A ``transport`` passed in
     belongs to the caller and is never closed.
     """
 
@@ -404,7 +417,12 @@ class KeylessClient:
         self._timeout = timeout
         self._transport = _BorrowedTransport(transport) if transport is not None else None
         self._http: httpx.Client | None = None
-        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The HTTP client is not copyable; a copy builds its own on first use.
+        state = self.__dict__.copy()
+        state["_http"] = None
+        return state
 
     def __enter__(self) -> KeylessClient:
         return self
@@ -414,13 +432,13 @@ class KeylessClient:
 
     def close(self) -> None:
         """Close the HTTP client; the next call builds a new one."""
-        with self._lock:
+        with CLIENT_LOCK:
             http, self._http = self._http, None
         if http is not None:
             http.close()
 
     def _client(self) -> httpx.Client:
-        with self._lock:
+        with CLIENT_LOCK:
             if self._http is None or self._http.is_closed:
                 self._http = httpx.Client(timeout=self._timeout, transport=self._transport)
             return self._http

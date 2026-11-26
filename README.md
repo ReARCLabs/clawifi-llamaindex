@@ -61,7 +61,7 @@ Options: `max_results` (default `5`; without a key the trial returns at most 3; 
 
 - **Path:** A key, or any client you pass, selects the REST API. The keyless trial is used only when there is neither. A key of only whitespace counts as no key, whether it is passed as an argument or set in `CLAWIFI_API_KEY`.
 - **Sync and async:** With a key, a mode whose client you did not pass is built with that key. It uses the `api_base` of the client you did pass, unless you set `api_base` yourself. Without a key, pass both `client` and `async_client` if you call both modes; if you pass only one, calls in the other mode raise `ClawifiClientConfigError`.
-- **Trial calls:** Clawifi's hosted MCP server is stateless, so each keyless call is a single `tools/call` request. If a server asks for initialization, the call initializes once, retries, and then ends any session the server opened. The trial limits count tool calls. Use `CLAWIFI_API_KEY` in production.
+- **Trial calls:** Clawifi's hosted MCP server is stateless, so each keyless call is a single `tools/call` request. If a server explicitly asks for initialization (JSON-RPC error -32002, or a "not initialized" / "missing session" / `Mcp-Session-Id` message), the call initializes once, retries, and then ends any session the server opened. A 404 after that fallback is not retried; the hosted server is stateless, so this does not come up there. The trial limits count tool calls. Use `CLAWIFI_API_KEY` in production.
 - **Closing:** `close()` closes the sync HTTP client, and the next call builds a new one. `aclose()` has nothing to close. A transport you pass in is never closed.
 
 ## Development

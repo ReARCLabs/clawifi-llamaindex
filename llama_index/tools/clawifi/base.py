@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional
 
@@ -11,6 +10,7 @@ from llama_index.core.tools.tool_spec.base import BaseToolSpec
 
 from clawifi import AsyncClawifi, Clawifi
 from llama_index.tools.clawifi._keyless import (
+    CLIENT_LOCK,
     KEYLESS_FETCH_TOOL,
     KEYLESS_MAX_RESULTS,
     KEYLESS_SEARCH_TOOL,
@@ -62,9 +62,15 @@ class ClawifiToolSpec(BaseToolSpec):
         self._async_client = async_client
         # A sync client this spec built itself (lazily, on first use).
         self._sync: Optional[Clawifi] = None
-        self._lock = threading.Lock()
         self._keyless_client = keyless_client
         self._async_keyless_client = async_keyless_client
+
+    def __getstate__(self) -> dict:
+        # Copies and pickles leave out the sync REST client the spec built itself;
+        # they build their own when needed. (Keyless clients handle this themselves.)
+        state = self.__dict__.copy()
+        state["_sync"] = None
+        return state
 
     @property
     def max_results(self) -> int:
@@ -83,7 +89,7 @@ class ClawifiToolSpec(BaseToolSpec):
         """
         if self._client is not None:
             return self._client
-        with self._lock:
+        with CLIENT_LOCK:
             if self._sync is None:
                 if self._async_client is not None and not self._has_key():
                     raise missing_client_error("async_client", "client")
@@ -113,14 +119,14 @@ class ClawifiToolSpec(BaseToolSpec):
 
     @property
     def keyless_client(self) -> KeylessClient:
-        with self._lock:
+        with CLIENT_LOCK:
             if self._keyless_client is None:
                 self._keyless_client = KeylessClient(api_base=self._api_base)
             return self._keyless_client
 
     @property
     def async_keyless_client(self) -> AsyncKeylessClient:
-        with self._lock:
+        with CLIENT_LOCK:
             if self._async_keyless_client is None:
                 self._async_keyless_client = AsyncKeylessClient(api_base=self._api_base)
             return self._async_keyless_client
@@ -129,7 +135,7 @@ class ClawifiToolSpec(BaseToolSpec):
         """Close the sync HTTP clients this spec built; the next call builds new ones."""
         if self._keyless_client is not None:
             self._keyless_client.close()
-        with self._lock:
+        with CLIENT_LOCK:
             sync, self._sync = self._sync, None
         if sync is not None:
             sync.close()
