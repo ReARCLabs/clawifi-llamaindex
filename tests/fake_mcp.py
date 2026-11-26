@@ -49,9 +49,15 @@ class FakeMcpServer:
         self.rpc_error: dict[str, Any] | None = None
         self.expire_session_once = False
         self.sessions_opened = 0
+        self.deleted_sessions: list[str | None] = []
+        self.sse_ping = False
 
     def methods(self) -> list[str]:
         return [body.get("method") for _, body in self.requests]
+
+    def open_sessions(self) -> int:
+        """Sessions opened and not yet ended with DELETE."""
+        return self.sessions_opened - len(self.deleted_sessions)
 
     def calls(self) -> list[dict[str, Any]]:
         return [body["params"] for _, body in self.requests if body.get("method") == "tools/call"]
@@ -69,11 +75,18 @@ class FakeMcpServer:
             text = "".join(
                 f"event: message\ndata: {json.dumps(item)}\n\n" for item in (note, message)
             )
+            if self.sse_ping:
+                text = "event: ping\ndata: ping\n\n" + text + ": keep-alive\n\n"
+
             headers["content-type"] = "text/event-stream"
             return httpx.Response(200, text=text, headers=headers)
         return httpx.Response(200, json=message, headers=headers)
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
+        assert "authorization" not in request.headers
+        if request.method == "DELETE":
+            self.deleted_sessions.append(request.headers.get("mcp-session-id"))
+            return httpx.Response(204)
         body = json.loads(request.content)
         self.requests.append((request, body))
         assert request.url.path == "/mcp"

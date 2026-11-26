@@ -55,7 +55,14 @@ page = spec.fetch(results[0].metadata["url"], query="who maintains it?")
 print(page[0].text)
 ```
 
-Options: `max_results` (default `5`; without a key the trial returns at most 3), `max_chars` (default `20000`; longer pages are cut and marked `truncated` in metadata), `api_base`, and pre-built `client` / `async_client`.
+Options: `max_results` (default `5`; without a key the trial returns at most 3; you can also change `spec.max_results` later), `max_chars` (default `20000`; longer pages are cut and marked `truncated` in metadata), `api_base`, and pre-built `client` / `async_client`.
+
+### Clients and sessions
+
+- **Which path is used:** Any key, or any client you pass, selects the REST API. The keyless trial is used only when there is neither.
+- **Passing only one client:** If you pass only `client` (sync) or only `async_client`, the other mode is built from its key, base URL, timeout and retries. If the given client has a custom transport or a proxy, those cannot be copied. In that case the other mode raises `ClawifiClientConfigError`; pass both clients. Other HTTP settings, such as TLS verification and connection limits, are not copied either.
+- **Trial sessions:** The keyless trial opens one MCP session and reuses it. Async calls get one session per event loop, and a new loop ends the previous loop's session. Call `close()` (sync) or `await aclose()` (async, from the same loop) when you are done, to end the session on the server.
+
 
 Each call uses Clawifi credits; see [Pricing and credits](https://clawifi.dev/docs/pricing-and-credits). See `examples/clawifi_agent.py` for a runnable script.
 

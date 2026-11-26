@@ -14,8 +14,10 @@ Every failure, including a reply that cannot be decoded, is raised as
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
+import math
 import os
 import threading
 from datetime import UTC, datetime
@@ -57,14 +59,20 @@ def mcp_url(api_base: str | None = None) -> str:
 
 
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
-    """Parse a ``Retry-After`` header: delay seconds or an HTTP date."""
+    """Parse a ``Retry-After`` header: delay seconds or an HTTP date.
+
+    Only finite, non-negative delays are accepted; ``nan``, ``inf`` and negative
+    numbers give ``None``. A date in the past means "now" (0 seconds).
+    """
     if not value or not value.strip():
         return None
     text = value.strip()
     try:
-        return max(float(text), 0.0)
+        seconds = float(text)
     except ValueError:
         pass
+    else:
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
     try:
         when = parsedate_to_datetime(text)
     except (TypeError, ValueError, IndexError):
@@ -150,22 +158,35 @@ def _loads(text: str, response: httpx.Response) -> Any:
         raise _bad_reply(response, f"invalid JSON ({exc})") from exc
 
 
-def _messages(response: httpx.Response) -> list[dict[str, Any]]:
-    """Decode a JSON or SSE reply into JSON-RPC messages."""
+def _sse_events(response: httpx.Response) -> tuple[list[dict[str, Any]], int]:
+    """Decode the JSON events of an SSE reply.
+
+    Returns the JSON-RPC messages and how many events could not be decoded.
+    Undecodable events (a keep-alive ping, say) are skipped, not fatal.
+    """
+    messages: list[dict[str, Any]] = []
+    unreadable = 0
+    data: list[str] = []
+    for line in [*response.text.splitlines(), ""]:
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+        elif line == "" and data:
+            try:
+                messages.extend(_as_list(json.loads("\n".join(data))))
+            except ValueError:
+                unreadable += 1
+            data = []
+    return messages, unreadable
+
+
+def _messages(response: httpx.Response) -> tuple[list[dict[str, Any]], int]:
+    """Decode a JSON or SSE reply into JSON-RPC messages (plus unreadable SSE events)."""
     content_type = response.headers.get("content-type", "")
     if "text/event-stream" in content_type:
-        messages: list[dict[str, Any]] = []
-        data: list[str] = []
-        for line in [*response.text.splitlines(), ""]:
-            if line.startswith("data:"):
-                data.append(line[5:].lstrip(" "))
-            elif line == "" and data:
-                messages.extend(_as_list(_loads("\n".join(data), response)))
-                data = []
-        return messages
+        return _sse_events(response)
     if not response.content:
-        return []
-    return _as_list(_loads(response.text, response))
+        return [], 0
+    return _as_list(_loads(response.text, response)), 0
 
 
 def _as_list(payload: Any) -> list[dict[str, Any]]:
@@ -183,7 +204,8 @@ def _rpc_error(error: Any) -> ClawifiKeylessError:
 
 
 def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
-    for message in _messages(response):
+    messages, unreadable = _messages(response)
+    for message in messages:
         if message.get("id") != request_id:
             continue
         if "error" in message:
@@ -194,6 +216,10 @@ def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise _bad_reply(response, "the JSON-RPC result is not an object")
         return result
+    if unreadable:
+        raise _bad_reply(
+            response, f"no JSON-RPC reply among its events ({unreadable} could not be decoded)"
+        )
     raise ClawifiKeylessError("Clawifi MCP server sent no reply to the request.")
 
 
@@ -251,6 +277,32 @@ def _call_request(request_id: int, name: str, arguments: dict[str, Any]) -> dict
 
 
 # -- clients -------------------------------------------------------------------
+#
+# An MCP session is opened once and reused for later calls. close()/aclose()
+# end it with an HTTP DELETE, as the streamable HTTP transport specifies. If the
+# server drops a session (HTTP 404), a new one is opened and the call retried once.
+
+
+class _Session:
+    """MCP session state shared by the sync and async clients."""
+
+    def __init__(self) -> None:
+        self.ids = itertools.count(1)
+        self.session_id: str | None = None
+        self.protocol: str | None = None
+        self.ready = False
+
+    def headers(self) -> dict[str, str]:
+        return _headers(self.session_id, self.protocol)
+
+    def opened(self, response: httpx.Response, result: dict[str, Any]) -> None:
+        self.session_id = response.headers.get("mcp-session-id")
+        self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
+
+    def reset(self) -> None:
+        self.session_id = None
+        self.protocol = None
+        self.ready = False
 
 
 class KeylessClient:
@@ -265,105 +317,88 @@ class KeylessClient:
     ) -> None:
         self.url = mcp_url(api_base)
         self._http = httpx.Client(timeout=timeout, transport=transport)
-        self._ids = itertools.count(1)
         self._lock = threading.Lock()
-        self.session_id: str | None = None
-        self.protocol: str | None = None
-        self._ready = False
+        self._session = _Session()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session.session_id
+
+    def __enter__(self) -> KeylessClient:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     def close(self) -> None:
-        self._http.close()
+        """End the MCP session (HTTP DELETE) and close the HTTP client."""
+        with self._lock:
+            if self._session.session_id and not self._http.is_closed:
+                try:
+                    self._http.delete(self.url, headers=self._session.headers())
+                except httpx.HTTPError:
+                    pass  # best effort: the server expires idle sessions too
+            self._session.reset()
+            self._http.close()
 
     def _post(self, body: dict[str, Any]) -> httpx.Response:
         try:
-            return self._http.post(
-                self.url, json=body, headers=_headers(self.session_id, self.protocol)
-            )
+            return self._http.post(self.url, json=body, headers=self._session.headers())
         except httpx.HTTPError as exc:
             raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
 
     def _initialize(self) -> None:
-        self.session_id = None
-        self.protocol = None
-        request_id = next(self._ids)
+        self._session.reset()
+        request_id = next(self._session.ids)
         response = self._post(_initialize_request(request_id))
         if response.status_code >= 400:
             raise _http_error(response)
-        result = _result(response, request_id)
-        self.session_id = response.headers.get("mcp-session-id")
-        self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
+        self._session.opened(response, _result(response, request_id))
         notified = self._post(_INITIALIZED)
         if notified.status_code >= 400:
             raise _http_error(notified)
-        self._ready = True
+        self._session.ready = True
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            if not self._ready:
+            if not self._session.ready:
                 self._initialize()
-            request_id = next(self._ids)
+            request_id = next(self._session.ids)
             response = self._post(_call_request(request_id, name, arguments))
-            if response.status_code == 404 and self.session_id:
+            if response.status_code == 404 and self._session.session_id:
                 # The server dropped the session: open a new one and retry once.
                 self._initialize()
-                request_id = next(self._ids)
+                request_id = next(self._session.ids)
                 response = self._post(_call_request(request_id, name, arguments))
             if response.status_code >= 400:
                 raise _http_error(response)
             return _tool_payload(_result(response, request_id))
 
 
-class _AsyncSession:
-    """One MCP session on one ``httpx.AsyncClient``, used for a single tool call."""
+class _LoopState:
+    """The HTTP client, lock and MCP session of one event loop."""
 
-    def __init__(self, http: httpx.AsyncClient, url: str, ids: itertools.count) -> None:
-        self.http = http
-        self.url = url
-        self.ids = ids
-        self.session_id: str | None = None
-        self.protocol: str | None = None
-
-    async def post(self, body: dict[str, Any]) -> httpx.Response:
-        try:
-            return await self.http.post(
-                self.url, json=body, headers=_headers(self.session_id, self.protocol)
-            )
-        except httpx.HTTPError as exc:
-            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
-
-    async def initialize(self) -> None:
-        self.session_id = None
-        self.protocol = None
-        request_id = next(self.ids)
-        response = await self.post(_initialize_request(request_id))
-        if response.status_code >= 400:
-            raise _http_error(response)
-        result = _result(response, request_id)
-        self.session_id = response.headers.get("mcp-session-id")
-        self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
-        notified = await self.post(_INITIALIZED)
-        if notified.status_code >= 400:
-            raise _http_error(notified)
-
-    async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        await self.initialize()
-        request_id = next(self.ids)
-        response = await self.post(_call_request(request_id, name, arguments))
-        if response.status_code == 404 and self.session_id:
-            await self.initialize()
-            request_id = next(self.ids)
-            response = await self.post(_call_request(request_id, name, arguments))
-        if response.status_code >= 400:
-            raise _http_error(response)
-        return _tool_payload(_result(response, request_id))
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        timeout: float,
+        transport: httpx.AsyncBaseTransport | None,
+    ) -> None:
+        self.loop = loop
+        self.http = httpx.AsyncClient(timeout=timeout, transport=transport)
+        self.lock = asyncio.Lock()
+        self.session = _Session()
 
 
 class AsyncKeylessClient:
     """Asynchronous keyless MCP client.
 
-    Each call opens its own ``httpx.AsyncClient`` and MCP session inside the
-    running event loop, so the client can be reused across ``asyncio.run`` calls
-    (nothing stays bound to a loop that has closed).
+    The HTTP client and MCP session belong to the event loop they were opened
+    in and are reused by later calls in that loop. When a call comes from a new
+    loop (a second ``asyncio.run``, say), a fresh HTTP client and session are
+    opened there, and the previous session is ended with a DELETE from the new
+    loop, so no session is left open on the server and nothing is used across
+    loops. ``aclose()`` ends the current session.
     """
 
     def __init__(
@@ -376,19 +411,146 @@ class AsyncKeylessClient:
         self.url = mcp_url(api_base)
         self._timeout = timeout
         self._transport = transport
-        self._ids = itertools.count(1)
+        self._state: _LoopState | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        return self._state.session.session_id if self._state else None
+
+    async def __aenter__(self) -> AsyncKeylessClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.aclose()
+
+    async def _delete(self, http: httpx.AsyncClient, session: _Session) -> None:
+        if not session.session_id:
+            return
+        try:
+            await http.delete(self.url, headers=session.headers())
+        except httpx.HTTPError:
+            pass  # best effort: the server expires idle sessions too
+
+    async def _close_http(self, http: httpx.AsyncClient) -> None:
+        # A transport passed in by the caller belongs to the caller: leave it open.
+        if self._transport is None:
+            await http.aclose()
 
     async def aclose(self) -> None:
-        """Kept for API symmetry; each call already closes its own HTTP client."""
+        """End the MCP session (HTTP DELETE) and close the HTTP client.
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        Call it from the event loop that made the calls.
+        """
+        state, self._state = self._state, None
+        if state is None:
+            return
+        if state.loop is asyncio.get_running_loop():
+            await self._delete(state.http, state.session)
+            await self._close_http(state.http)
+        elif state.session.session_id:
+            await self._end_orphan(state.session)
+
+    async def _end_orphan(self, session: _Session) -> None:
+        """End a session opened in a loop that is gone, from the current loop."""
         http = httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
         try:
-            return await _AsyncSession(http, self.url, self._ids).call(name, arguments)
+            await self._delete(http, session)
         finally:
-            # A transport passed in by the caller belongs to the caller: leave it open.
-            if self._transport is None:
-                await http.aclose()
+            await self._close_http(http)
+
+    async def _current(self) -> _LoopState:
+        loop = asyncio.get_running_loop()
+        state = self._state
+        if state is not None and state.loop is loop:
+            return state
+        fresh = _LoopState(loop, self._timeout, self._transport)
+        self._state = fresh
+        if state is not None and state.session.session_id:
+            # The old loop's client cannot be used here; end its session from this loop.
+            await self._delete(fresh.http, state.session)
+        return fresh
+
+    async def _post(self, state: _LoopState, body: dict[str, Any]) -> httpx.Response:
+        try:
+            return await state.http.post(self.url, json=body, headers=state.session.headers())
+        except httpx.HTTPError as exc:
+            raise ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}") from exc
+
+    async def _initialize(self, state: _LoopState) -> None:
+        state.session.reset()
+        request_id = next(state.session.ids)
+        response = await self._post(state, _initialize_request(request_id))
+        if response.status_code >= 400:
+            raise _http_error(response)
+        state.session.opened(response, _result(response, request_id))
+        notified = await self._post(state, _INITIALIZED)
+        if notified.status_code >= 400:
+            raise _http_error(notified)
+        state.session.ready = True
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        state = await self._current()
+        async with state.lock:
+            if not state.session.ready:
+                await self._initialize(state)
+            request_id = next(state.session.ids)
+            response = await self._post(state, _call_request(request_id, name, arguments))
+            if response.status_code == 404 and state.session.session_id:
+                await self._initialize(state)
+                request_id = next(state.session.ids)
+                response = await self._post(state, _call_request(request_id, name, arguments))
+            if response.status_code >= 400:
+                raise _http_error(response)
+            return _tool_payload(_result(response, request_id))
+
+
+# -- building the other mode's REST client ---------------------------------------
+
+
+class ClawifiClientConfigError(ClawifiError):
+    """Only one of ``client`` / ``async_client`` was given and it cannot be mirrored."""
+
+
+_DEFAULT_POOLS = ("ConnectionPool", "AsyncConnectionPool")
+
+
+def _mount_signature(http: Any) -> list[tuple[str, str]]:
+    signature = []
+    for pattern, transport in (getattr(http, "_mounts", None) or {}).items():
+        pool = getattr(transport, "_pool", None)
+        proxy = getattr(pool, "_proxy_url", None)
+        signature.append((str(getattr(pattern, "pattern", pattern)), repr(proxy)))
+    return sorted(signature)
+
+
+def http_settings_copyable(sdk_client: Any) -> bool:
+    """True when the SDK client's HTTP layer is the default one (no custom transport or proxy).
+
+    Only then can the client for the other mode (sync/async) be rebuilt from
+    ``.config`` without losing anything. Environment proxies count as default,
+    since a new client picks them up too.
+    """
+    http = getattr(sdk_client, "_client", None)
+    transport = getattr(http, "_transport", None)
+    if http is None or transport is None or not hasattr(http, "_mounts"):
+        return False
+    if type(transport) not in (httpx.HTTPTransport, httpx.AsyncHTTPTransport):
+        return False
+    if type(getattr(transport, "_pool", None)).__name__ not in _DEFAULT_POOLS:
+        return False
+    reference = httpx.Client(trust_env=getattr(http, "trust_env", True))
+    try:
+        return _mount_signature(http) == _mount_signature(reference)
+    finally:
+        reference.close()
+
+
+def require_copyable(sdk_client: Any, given: str, missing: str) -> None:
+    if not http_settings_copyable(sdk_client):
+        raise ClawifiClientConfigError(
+            f"Only {given} was given, and its HTTP settings (a custom transport or proxy) "
+            f"cannot be copied to {missing}. Pass {missing}= as well."
+        )
 
 
 def search_arguments(query: str) -> dict[str, Any]:

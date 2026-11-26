@@ -18,6 +18,7 @@ from llama_index.tools.clawifi._keyless import (
     KeylessClient,
     fetch_arguments,
     keyless_note,
+    require_copyable,
     search_arguments,
 )
 
@@ -53,23 +54,41 @@ class ClawifiToolSpec(BaseToolSpec):
         self._api_base = api_base
         # None means "not set by the user": the default of 5 is used, and a keyless
         # note never claims the user asked for more than the trial's 3 results.
-        self._max_results_set = max_results is not None
-        self.max_results = max_results if max_results is not None else DEFAULT_MAX_RESULTS
+        self._max_results: Optional[int] = max_results
         self.max_chars = max_chars
+        # Clients the user passed in. They alone decide REST over keyless.
         self._client = client
         self._async_client = async_client
+        # A sync client this spec built itself (lazily, on first use).
+        self._sync: Optional[Clawifi] = None
         self._keyless_client = keyless_client
         self._async_keyless_client = async_keyless_client
 
     @property
+    def max_results(self) -> int:
+        """Default result count; 5 unless set. Setting it counts as the user's request."""
+        return self._max_results if self._max_results is not None else DEFAULT_MAX_RESULTS
+
+    @max_results.setter
+    def max_results(self, value: Optional[int]) -> None:
+        self._max_results = value
+
+    @property
     def client(self) -> Clawifi:
-        if self._client is None:
+        """The sync REST client: the one passed in, else one built (and kept) by the spec.
+
+        Reading it never switches the spec from keyless to REST.
+        """
+        if self._client is not None:
+            return self._client
+        if self._sync is None:
             if self._async_client is not None:
-                # Only an async client was given: reuse its key and base URL.
-                self._client = Clawifi(config=self._async_client.config)
+                # Only an async client was given: mirror it if nothing would be lost.
+                require_copyable(self._async_client, "async_client", "client")
+                self._sync = Clawifi(config=self._async_client.config)
             else:
-                self._client = Clawifi(api_key=self._api_key, api_base=self._api_base)
-        return self._client
+                self._sync = Clawifi(api_key=self._api_key, api_base=self._api_base)
+        return self._sync
 
     @asynccontextmanager
     async def _async_rest(self) -> AsyncIterator[AsyncClawifi]:
@@ -83,7 +102,8 @@ class ClawifiToolSpec(BaseToolSpec):
             yield self._async_client
             return
         if self._client is not None:
-            # Only a sync client was given: reuse its key and base URL.
+            # Only a sync client was given: mirror it if nothing would be lost.
+            require_copyable(self._client, "client", "async_client")
             client = AsyncClawifi(config=self._client.config)
         else:
             client = AsyncClawifi(api_key=self._api_key, api_base=self._api_base)
@@ -104,6 +124,19 @@ class ClawifiToolSpec(BaseToolSpec):
             self._async_keyless_client = AsyncKeylessClient(api_base=self._api_base)
         return self._async_keyless_client
 
+    def close(self) -> None:
+        """End the keyless MCP session (if any) and close the clients this spec built."""
+        if self._keyless_client is not None:
+            self._keyless_client.close()
+        if self._sync is not None:
+            self._sync.close()
+            self._sync = None
+
+    async def aclose(self) -> None:
+        """End the async keyless MCP session (if any). Call it from the loop that used it."""
+        if self._async_keyless_client is not None:
+            await self._async_keyless_client.aclose()
+
     def _has_key(self) -> bool:
         return bool(self._api_key or (os.getenv("CLAWIFI_API_KEY") or "").strip())
 
@@ -115,7 +148,7 @@ class ClawifiToolSpec(BaseToolSpec):
         """The result count the user asked for: per call, or set on the spec; else None."""
         if max_results is not None:
             return max_results
-        return self.max_results if self._max_results_set else None
+        return self._max_results
 
     # -- search -------------------------------------------------------------
 

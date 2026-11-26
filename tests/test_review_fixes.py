@@ -17,49 +17,8 @@ from clawifi import AsyncClawifi, Clawifi, ClawifiError
 import llama_index.tools.clawifi._keyless as keyless_module
 from llama_index.tools.clawifi import ClawifiKeylessError, ClawifiToolSpec
 from llama_index.tools.clawifi._keyless import KeylessClient, retry_after_seconds
+from tests.conftest import Router
 from tests.fake_mcp import FETCH_PAYLOAD, SEARCH_PAYLOAD, FakeMcpServer
-
-
-class Router:
-    def __init__(self, mcp: FakeMcpServer) -> None:
-        self.mcp = mcp
-        self.rest: list[httpx.Request] = []
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/mcp":
-            return self.mcp(request)
-        self.rest.append(request)
-        payload = SEARCH_PAYLOAD if request.url.path == "/search/free" else FETCH_PAYLOAD
-        return httpx.Response(200, json=payload)
-
-
-@pytest.fixture
-def router(monkeypatch: pytest.MonkeyPatch) -> Router:
-    """Route self-built httpx clients to fakes; async clients fail across event loops."""
-    route = Router(FakeMcpServer())
-    real_async, real_sync = httpx.AsyncClient, httpx.Client
-
-    class LoopBoundAsyncClient(real_async):  # type: ignore[misc, valid-type]
-        def __init__(self, *args: Any, transport: Any = None, **kwargs: Any) -> None:
-            super().__init__(*args, transport=transport or httpx.MockTransport(route), **kwargs)
-            self.loop_seen: asyncio.AbstractEventLoop | None = None
-
-        async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
-            loop = asyncio.get_running_loop()
-            if self.loop_seen is None:
-                self.loop_seen = loop
-            elif self.loop_seen is not loop:
-                raise RuntimeError("Event loop is closed")
-            return await super().send(request, **kwargs)
-
-    class RoutedClient(real_sync):  # type: ignore[misc, valid-type]
-        def __init__(self, *args: Any, transport: Any = None, **kwargs: Any) -> None:
-            super().__init__(*args, transport=transport or httpx.MockTransport(route), **kwargs)
-
-    monkeypatch.setattr(httpx, "AsyncClient", LoopBoundAsyncClient)
-    monkeypatch.setattr(httpx, "Client", RoutedClient)
-    return route
-
 
 # Finding 1 ----------------------------------------------------------------------
 
@@ -179,3 +138,4 @@ def test_retry_after_seconds() -> None:
         == 45
     )
     assert retry_after_seconds("later") is None
+    assert retry_after_seconds("-3") is None
