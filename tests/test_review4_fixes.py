@@ -20,31 +20,9 @@ def async_spec(server: FakeMcpServer) -> ClawifiToolSpec:
     )
 
 
-def test_two_concurrent_searches_open_two_sessions_and_end_both() -> None:
-    server = FakeMcpServer()
-    spec = async_spec(server)
-
-    async def both() -> list:
-        return await asyncio.gather(spec.asearch("a"), spec.asearch("b"))
-
-    first, second = asyncio.run(both())
-    assert first and second
-    assert server.sessions_opened == 2
-    assert sorted(server.deleted_sessions) == ["sess-1-1", "sess-1-2"]
-    assert server.open_sessions() == 0
-
-
-def test_failed_call_still_deletes_its_session() -> None:
-    server = FakeMcpServer()
-    server.tool_error = "Sign in to use this tool"
-    with pytest.raises(ClawifiKeylessError):
-        asyncio.run(async_spec(server).afetch("https://example.com"))
-    assert server.deleted_sessions == ["sess-1-1"]
-
-
 def test_invalid_url_is_wrapped() -> None:
     with pytest.raises(ClawifiKeylessError, match="unreachable"):
-        ClawifiToolSpec(api_base="http://[bad").search("mcp")
+        ClawifiToolSpec(api_base="http://exa\tmple").search("mcp")
 
 
 def test_close_then_search_works() -> None:
@@ -53,7 +31,7 @@ def test_close_then_search_works() -> None:
     spec.search("a")
     spec.close()
     spec.search("b")
-    assert server.open_sessions() == 0 and server.sessions_opened == 2
+    assert server.methods() == ["tools/call", "tools/call"]
 
 
 def test_key_and_only_async_client_sync_call_uses_the_key(router: Router) -> None:

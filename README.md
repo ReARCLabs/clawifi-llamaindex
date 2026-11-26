@@ -59,10 +59,10 @@ Options: `max_results` (default `5`; without a key the trial returns at most 3; 
 
 ### Clients and sessions
 
-- **Path:** Any key, or any client you pass, selects the REST API. The keyless trial is used only when there is neither.
-- **Sync and async:** With a key (`api_key` or `CLAWIFI_API_KEY`), a mode whose client you did not pass is built with that key. Without a key, pass both `client` and `async_client` if you call both modes; if you pass only one, calls in the other mode raise `ClawifiClientConfigError`.
-- **Trial sessions:** The keyless trial opens a short MCP session for every call and ends it when the call returns, so concurrent calls never share state. That costs a few extra requests per call (and a fresh connection for each async call). Use `CLAWIFI_API_KEY` in production.
-- **Closing:** `close()` closes the sync HTTP client; the next call builds a new one. `aclose()` has nothing to close. A transport you pass in is never closed.
+- **Path:** A key, or any client you pass, selects the REST API. The keyless trial is used only when there is neither. A key of only whitespace counts as no key, whether it is passed as an argument or set in `CLAWIFI_API_KEY`.
+- **Sync and async:** With a key, a mode whose client you did not pass is built with that key. It uses the `api_base` of the client you did pass, unless you set `api_base` yourself. Without a key, pass both `client` and `async_client` if you call both modes; if you pass only one, calls in the other mode raise `ClawifiClientConfigError`.
+- **Trial calls:** Clawifi's hosted MCP server is stateless, so each keyless call is a single `tools/call` request. If a server asks for initialization, the call initializes once, retries, and then ends any session the server opened. The trial limits count tool calls. Use `CLAWIFI_API_KEY` in production.
+- **Closing:** `close()` closes the sync HTTP client, and the next call builds a new one. `aclose()` has nothing to close. A transport you pass in is never closed.
 
 ## Development
 

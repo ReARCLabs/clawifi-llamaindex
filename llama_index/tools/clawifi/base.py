@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import threading
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, List, Optional
 
@@ -19,6 +19,7 @@ from llama_index.tools.clawifi._keyless import (
     fetch_arguments,
     keyless_note,
     missing_client_error,
+    resolve_key,
     search_arguments,
 )
 
@@ -61,6 +62,7 @@ class ClawifiToolSpec(BaseToolSpec):
         self._async_client = async_client
         # A sync client this spec built itself (lazily, on first use).
         self._sync: Optional[Clawifi] = None
+        self._lock = threading.Lock()
         self._keyless_client = keyless_client
         self._async_keyless_client = async_keyless_client
 
@@ -81,11 +83,14 @@ class ClawifiToolSpec(BaseToolSpec):
         """
         if self._client is not None:
             return self._client
-        if self._sync is None:
-            if self._async_client is not None and not self._has_key():
-                raise missing_client_error("async_client", "client")
-            self._sync = Clawifi(api_key=self._api_key, api_base=self._api_base)
-        return self._sync
+        with self._lock:
+            if self._sync is None:
+                if self._async_client is not None and not self._has_key():
+                    raise missing_client_error("async_client", "client")
+                self._sync = Clawifi(
+                    api_key=self._key(), api_base=self._base_from(self._async_client)
+                )
+            return self._sync
 
     @asynccontextmanager
     async def _async_rest(self) -> AsyncIterator[AsyncClawifi]:
@@ -100,7 +105,7 @@ class ClawifiToolSpec(BaseToolSpec):
             return
         if self._client is not None and not self._has_key():
             raise missing_client_error("client", "async_client")
-        client = AsyncClawifi(api_key=self._api_key, api_base=self._api_base)
+        client = AsyncClawifi(api_key=self._key(), api_base=self._base_from(self._client))
         try:
             yield client
         finally:
@@ -108,31 +113,44 @@ class ClawifiToolSpec(BaseToolSpec):
 
     @property
     def keyless_client(self) -> KeylessClient:
-        if self._keyless_client is None:
-            self._keyless_client = KeylessClient(api_base=self._api_base)
-        return self._keyless_client
+        with self._lock:
+            if self._keyless_client is None:
+                self._keyless_client = KeylessClient(api_base=self._api_base)
+            return self._keyless_client
 
     @property
     def async_keyless_client(self) -> AsyncKeylessClient:
-        if self._async_keyless_client is None:
-            self._async_keyless_client = AsyncKeylessClient(api_base=self._api_base)
-        return self._async_keyless_client
+        with self._lock:
+            if self._async_keyless_client is None:
+                self._async_keyless_client = AsyncKeylessClient(api_base=self._api_base)
+            return self._async_keyless_client
 
     def close(self) -> None:
         """Close the sync HTTP clients this spec built; the next call builds new ones."""
         if self._keyless_client is not None:
             self._keyless_client.close()
-        if self._sync is not None:
-            self._sync.close()
-            self._sync = None
+        with self._lock:
+            sync, self._sync = self._sync, None
+        if sync is not None:
+            sync.close()
 
     async def aclose(self) -> None:
         """Kept for symmetry: async calls already close their own clients and sessions."""
         if self._async_keyless_client is not None:
             await self._async_keyless_client.aclose()
 
+    def _key(self) -> Optional[str]:
+        """The API key (argument, else CLAWIFI_API_KEY), or None; whitespace means none."""
+        return resolve_key(self._api_key)
+
     def _has_key(self) -> bool:
-        return bool(self._api_key or (os.getenv("CLAWIFI_API_KEY") or "").strip())
+        return self._key() is not None
+
+    def _base_from(self, given: Any) -> Optional[str]:
+        """API base for a client built with the key: the spec's, else the given client's."""
+        if self._api_base:
+            return self._api_base
+        return given.config.api_base if given is not None else None
 
     def _keyless(self) -> bool:
         """Use the keyless trial only with no key and no pre-built REST client at all."""

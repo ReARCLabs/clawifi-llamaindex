@@ -24,7 +24,7 @@ def keyless_spec(server: FakeMcpServer, **kwargs) -> ClawifiToolSpec:
 def test_search_keyless_caps_and_notes() -> None:
     server = FakeMcpServer()
     docs = keyless_spec(server).search("mcp", max_results=10, time_range="month")
-    assert server.methods() == ["initialize", "notifications/initialized", "tools/call"]
+    assert server.methods() == ["tools/call"]  # round 5: one POST per call
     assert server.calls() == [{"name": "search_free", "arguments": {"query": "mcp"}}]
     assert [d.metadata["rank"] for d in docs] == [1, 2, 3]
     note = docs[0].metadata["keyless_note"]
@@ -50,17 +50,6 @@ def test_fetch_keyless_sse_same_fields() -> None:
         "title": "Example Domain",
         "content_status": "ok",
     }
-
-
-def test_each_call_opens_and_ends_its_session_and_reopens_on_404() -> None:
-    server = FakeMcpServer()
-    server.expire_session_once = True
-    spec = keyless_spec(server)
-    spec.fetch("https://example.com")  # 404 on the first session, retried once
-    spec.fetch("https://example.com")
-    assert server.methods().count("initialize") == 3
-    assert server.deleted_sessions == ["sess-1-2", "sess-1-3"]
-    assert server.open_sessions() == 0
 
 
 def test_rate_limit_and_tool_error() -> None:

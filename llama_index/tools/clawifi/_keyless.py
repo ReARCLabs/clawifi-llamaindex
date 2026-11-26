@@ -3,12 +3,10 @@
 Clawifi's REST API needs a key. Without one, the hosted MCP server at
 ``https://api.clawifi.dev/mcp`` still answers a few trial tools, among them
 ``search_free`` and ``fetch_url`` (12 calls a minute and 50 a day per address,
-at most 3 search results, no domain or time filters). This module speaks just
-enough MCP over streamable HTTP to call those two tools: ``initialize``, then
-``notifications/initialized``, then ``tools/call``, carrying ``Mcp-Session-Id``
-and reading either a JSON or an SSE (``text/event-stream``) reply.
-
-Every failure, including a reply that cannot be decoded, is raised as
+at most 3 search results, no domain or time filters). The hosted server is
+stateless, so each call is one ``tools/call`` POST over streamable HTTP; the
+reply may be JSON or SSE (``text/event-stream``). See the clients section for
+the initialization fallback and for which errors become
 :class:`ClawifiKeylessError`, a subclass of ``clawifi.ClawifiError``.
 """
 
@@ -18,6 +16,7 @@ import itertools
 import json
 import math
 import os
+import threading
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -201,24 +200,64 @@ def _rpc_error(error: Any) -> ClawifiKeylessError:
     return ClawifiKeylessError(f"Clawifi keyless call failed: {error}")
 
 
-def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
+def _find_message(response: httpx.Response, request_id: int) -> dict[str, Any]:
+    """The JSON-RPC message that answers ``request_id``."""
     messages, unreadable = _messages(response)
     for message in messages:
-        if message.get("id") != request_id:
-            continue
-        if "error" in message:
-            raise _rpc_error(message["error"])
-        result = message.get("result")
-        if result is None:
-            return {}
-        if not isinstance(result, dict):
-            raise _bad_reply(response, "the JSON-RPC result is not an object")
-        return result
+        if message.get("id") == request_id:
+            return message
     if unreadable:
         raise _bad_reply(
             response, f"no JSON-RPC reply among its events ({unreadable} could not be decoded)"
         )
     raise ClawifiKeylessError("Clawifi MCP server sent no reply to the request.")
+
+
+def _message_result(response: httpx.Response, message: dict[str, Any]) -> dict[str, Any]:
+    if "error" in message:
+        raise _rpc_error(message["error"])
+    result = message.get("result")
+    if result is None:
+        return {}
+    if not isinstance(result, dict):
+        raise _bad_reply(response, "the JSON-RPC result is not an object")
+    return result
+
+
+def _result(response: httpx.Response, request_id: int) -> dict[str, Any]:
+    return _message_result(response, _find_message(response, request_id))
+
+
+# A stateless server answers tools/call directly. A stateful one refuses it until
+# the client initializes: with JSON-RPC error -32002, or a message about
+# initialization or a session, sometimes as HTTP 400.
+_INIT_HINTS = ("not initialized", "initializ", "session")
+_NOT_INITIALIZED_CODE = -32002
+
+
+def _asks_for_initialize(text: str) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in _INIT_HINTS)
+
+
+def _rpc_asks_for_initialize(error: Any) -> bool:
+    if isinstance(error, dict):
+        if error.get("code") == _NOT_INITIALIZED_CODE:
+            return True
+        return _asks_for_initialize(str(error.get("message") or ""))
+    return _asks_for_initialize(str(error))
+
+
+def _call_outcome(response: httpx.Response, request_id: int) -> dict[str, Any] | None:
+    """The tool's JSON result, or None when the server asks for initialization first."""
+    if response.status_code == 400 and _asks_for_initialize(response.text):
+        return None
+    if response.status_code >= 400:
+        raise _http_error(response)
+    message = _find_message(response, request_id)
+    if "error" in message and _rpc_asks_for_initialize(message["error"]):
+        return None
+    return _tool_payload(_message_result(response, message))
 
 
 def _tool_payload(result: dict[str, Any]) -> dict[str, Any]:
@@ -276,19 +315,29 @@ def _call_request(request_id: int, name: str, arguments: dict[str, Any]) -> dict
 
 # -- clients -------------------------------------------------------------------
 #
-# Every keyless call opens its own short MCP session: initialize, then
-# notifications/initialized, then tools/call, and finally an HTTP DELETE to end
-# the session (a failed DELETE is ignored). Nothing about a session is shared
-# between calls, so concurrent calls cannot interfere. The live server keeps no
-# session state anyway; a session ID it sends back is used only within the call.
-# Opening a session per call costs a few extra requests; that is accepted for
-# the trial, and production use should set CLAWIFI_API_KEY.
+# Clawifi's hosted MCP server is stateless and answers in JSON, so a keyless
+# call is a single POST of ``tools/call`` (the trial limits count tool calls).
+# Only if a server explicitly asks for initialization does the call fall back to
+# initialize -> notifications/initialized -> tools/call; if that server returned
+# an ``Mcp-Session-Id``, the session is ended with a short DELETE afterwards
+# (skipped on cancellation, errors ignored).
 #
-# Every failure is raised as ClawifiKeylessError: HTTP status errors, bad
-# replies, and any httpx.HTTPError, httpx.InvalidURL, httpx.StreamError or
-# RuntimeError (such as a closed client) raised while sending a request.
+# Wrapped as ClawifiKeylessError: HTTP status errors, bad replies, and while
+# sending a request any httpx.HTTPError, httpx.InvalidURL or httpx.StreamError,
+# plus httpx's "client has been closed" RuntimeError. Other errors propagate.
 
-_TRANSPORT_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError, RuntimeError)
+_HTTPX_ERRORS = (httpx.HTTPError, httpx.InvalidURL, httpx.StreamError)
+DELETE_TIMEOUT = 2.0
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    if isinstance(exc, _HTTPX_ERRORS):
+        return True
+    return isinstance(exc, RuntimeError) and "client has been closed" in str(exc)
+
+
+def _unreachable(exc: BaseException) -> ClawifiKeylessError:
+    return ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}")
 
 
 class _BorrowedTransport(httpx.BaseTransport):
@@ -318,12 +367,12 @@ class _BorrowedAsyncTransport(httpx.AsyncBaseTransport):
 
 
 class _Session:
-    """One call's MCP session: request IDs, session ID and negotiated protocol."""
+    """One call's MCP state: request IDs, the protocol version and any session ID."""
 
     def __init__(self) -> None:
         self.ids = itertools.count(1)
         self.session_id: str | None = None
-        self.protocol: str | None = None
+        self.protocol: str = PROTOCOL_VERSION
 
     def headers(self) -> dict[str, str]:
         return _headers(self.session_id, self.protocol)
@@ -333,16 +382,15 @@ class _Session:
         self.protocol = str(result.get("protocolVersion") or PROTOCOL_VERSION)
 
 
-def _unreachable(exc: BaseException) -> ClawifiKeylessError:
-    return ClawifiKeylessError(f"Clawifi MCP server unreachable: {exc}")
+_STILL_NOT_INITIALIZED = "Clawifi MCP server still asks for initialization after initialize."
 
 
 class KeylessClient:
-    """Synchronous keyless MCP client.
+    """Synchronous keyless MCP client: one ``tools/call`` POST per call.
 
-    Each ``call_tool`` opens and ends its own MCP session. One ``httpx.Client``
-    is reused across calls; ``close()`` closes it, and the next call builds a new
-    one. A ``transport`` passed in belongs to the caller and is never closed.
+    One ``httpx.Client`` is built lazily (under a lock) and reused; ``close()``
+    closes it and the next call builds a new one. A ``transport`` passed in
+    belongs to the caller and is never closed.
     """
 
     def __init__(
@@ -356,6 +404,7 @@ class KeylessClient:
         self._timeout = timeout
         self._transport = _BorrowedTransport(transport) if transport is not None else None
         self._http: httpx.Client | None = None
+        self._lock = threading.Lock()
 
     def __enter__(self) -> KeylessClient:
         return self
@@ -365,22 +414,31 @@ class KeylessClient:
 
     def close(self) -> None:
         """Close the HTTP client; the next call builds a new one."""
-        http, self._http = self._http, None
+        with self._lock:
+            http, self._http = self._http, None
         if http is not None:
             http.close()
 
     def _client(self) -> httpx.Client:
-        http = self._http
-        if http is None or http.is_closed:
-            http = httpx.Client(timeout=self._timeout, transport=self._transport)
-            self._http = http
-        return http
+        with self._lock:
+            if self._http is None or self._http.is_closed:
+                self._http = httpx.Client(timeout=self._timeout, transport=self._transport)
+            return self._http
 
     def _post(self, http: httpx.Client, session: _Session, body: dict[str, Any]) -> httpx.Response:
         try:
             return http.post(self.url, json=body, headers=session.headers())
-        except _TRANSPORT_ERRORS as exc:
-            raise _unreachable(exc) from exc
+        except Exception as exc:
+            if _is_transport_error(exc):
+                raise _unreachable(exc) from exc
+            raise
+
+    def _send_call(
+        self, http: httpx.Client, session: _Session, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        request_id = next(session.ids)
+        response = self._post(http, session, _call_request(request_id, name, arguments))
+        return _call_outcome(response, request_id)
 
     def _initialize(self, http: httpx.Client, session: _Session) -> None:
         request_id = next(session.ids)
@@ -396,39 +454,38 @@ class KeylessClient:
         if not session.session_id:
             return
         try:
-            http.delete(self.url, headers=session.headers())
-        except _TRANSPORT_ERRORS:
-            pass  # best effort: the server expires idle sessions too
+            http.delete(self.url, headers=session.headers(), timeout=DELETE_TIMEOUT)
+        except Exception:  # noqa: BLE001 - best-effort cleanup, never hides the result
+            pass
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
             http = self._client()
-        except _TRANSPORT_ERRORS as exc:
-            raise _unreachable(exc) from exc
+        except Exception as exc:
+            if _is_transport_error(exc):
+                raise _unreachable(exc) from exc
+            raise
+        payload = self._send_call(http, _Session(), name, arguments)
+        if payload is not None:
+            return payload
+        # The server asked for initialization: do it once, then call again.
         session = _Session()
         try:
             self._initialize(http, session)
-            request_id = next(session.ids)
-            response = self._post(http, session, _call_request(request_id, name, arguments))
-            if response.status_code == 404 and session.session_id:
-                # The server lost the session: open a new one and retry once.
-                session = _Session()
-                self._initialize(http, session)
-                request_id = next(session.ids)
-                response = self._post(http, session, _call_request(request_id, name, arguments))
-            if response.status_code >= 400:
-                raise _http_error(response)
-            return _tool_payload(_result(response, request_id))
+            payload = self._send_call(http, session, name, arguments)
+            if payload is None:
+                raise ClawifiKeylessError(_STILL_NOT_INITIALIZED)
+            return payload
         finally:
             self._end(http, session)
 
 
 class AsyncKeylessClient:
-    """Asynchronous keyless MCP client.
+    """Asynchronous keyless MCP client: one ``tools/call`` POST per call.
 
-    Each ``call_tool`` opens its own ``httpx.AsyncClient`` (``async with``) and
-    its own MCP session, and ends both before returning. Nothing is shared
-    between calls, so concurrent calls and repeated ``asyncio.run`` are safe. A
+    Each call opens its own ``httpx.AsyncClient`` and closes it before
+    returning, so concurrent calls and repeated ``asyncio.run`` are safe. An
+    error while closing never hides an error raised by the call itself. A
     ``transport`` passed in belongs to the caller and is never closed.
     """
 
@@ -450,15 +507,24 @@ class AsyncKeylessClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Nothing to close: every call already closed its own client and session."""
+        """Nothing to close: every call closes its own client."""
 
     async def _post(
         self, http: httpx.AsyncClient, session: _Session, body: dict[str, Any]
     ) -> httpx.Response:
         try:
             return await http.post(self.url, json=body, headers=session.headers())
-        except _TRANSPORT_ERRORS as exc:
-            raise _unreachable(exc) from exc
+        except Exception as exc:
+            if _is_transport_error(exc):
+                raise _unreachable(exc) from exc
+            raise
+
+    async def _send_call(
+        self, http: httpx.AsyncClient, session: _Session, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        request_id = next(session.ids)
+        response = await self._post(http, session, _call_request(request_id, name, arguments))
+        return _call_outcome(response, request_id)
 
     async def _initialize(self, http: httpx.AsyncClient, session: _Session) -> None:
         request_id = next(session.ids)
@@ -474,42 +540,62 @@ class AsyncKeylessClient:
         if not session.session_id:
             return
         try:
-            await http.delete(self.url, headers=session.headers())
-        except _TRANSPORT_ERRORS:
-            pass  # best effort: the server expires idle sessions too
+            await http.delete(self.url, headers=session.headers(), timeout=DELETE_TIMEOUT)
+        except Exception:  # noqa: BLE001 - best-effort cleanup, never hides the result
+            pass
 
     async def _call(
         self, http: httpx.AsyncClient, name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        payload = await self._send_call(http, _Session(), name, arguments)
+        if payload is not None:
+            return payload
+        # The server asked for initialization: do it once, then call again.
         session = _Session()
         try:
             await self._initialize(http, session)
-            request_id = next(session.ids)
-            response = await self._post(http, session, _call_request(request_id, name, arguments))
-            if response.status_code == 404 and session.session_id:
-                # The server lost the session: open a new one and retry once.
-                session = _Session()
-                await self._initialize(http, session)
-                request_id = next(session.ids)
-                response = await self._post(
-                    http, session, _call_request(request_id, name, arguments)
-                )
-            if response.status_code >= 400:
-                raise _http_error(response)
-            return _tool_payload(_result(response, request_id))
-        finally:
-            await self._end(http, session)
+            payload = await self._send_call(http, session, name, arguments)
+            if payload is None:
+                raise ClawifiKeylessError(_STILL_NOT_INITIALIZED)
+        except Exception:
+            await self._end(http, session)  # errors in _end are swallowed
+            raise
+        # A cancellation (BaseException) skips the DELETE above and below.
+        await self._end(http, session)
+        return payload
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        http = httpx.AsyncClient(timeout=self._timeout, transport=self._transport)
         try:
-            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as http:
-                return await self._call(http, name, arguments)
-        except _TRANSPORT_ERRORS as exc:
-            # e.g. a failure while closing the client; the call itself wraps its own errors
-            raise _unreachable(exc) from exc
+            payload = await self._call(http, name, arguments)
+        except BaseException:
+            try:
+                await http.aclose()
+            except Exception:  # noqa: BLE001 - never hide the call's own error
+                pass
+            raise
+        try:
+            await http.aclose()
+        except Exception as exc:
+            if _is_transport_error(exc):
+                raise _unreachable(exc) from exc
+            raise
+        return payload
 
 
-# -- one given client, the other mode called -------------------------------------
+# -- API keys and the REST clients ------------------------------------------------
+
+
+def clean_key(value: str | None) -> str | None:
+    """A usable API key, or None: a key of only whitespace counts as no key."""
+    if value is None:
+        return None
+    return value.strip() or None
+
+
+def resolve_key(explicit: str | None) -> str | None:
+    """The API key to use: the explicit one, else ``CLAWIFI_API_KEY``; blank means none."""
+    return clean_key(explicit) or clean_key(os.getenv("CLAWIFI_API_KEY"))
 
 
 class ClawifiClientConfigError(ClawifiError):
